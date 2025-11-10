@@ -180,9 +180,12 @@ class Agent:
 
             # If there are execution messages in this round, summarize them
             if execution_messages:
-                summary_text = await self._create_summary(execution_messages, user_idx, i + 1)
+                summary_text = await self._create_summary(execution_messages, i + 1)
                 if summary_text:
-                    summary_message = Message(role="user", content=f"[Assistant Execution Summary]\n\n{summary_text}")
+                    summary_message = Message(
+                        role="user",
+                        content=f"[Assistant Execution Summary]\n\n{summary_text}",
+                    )
                     new_messages.append(summary_message)
                     summary_count += 1
 
@@ -190,19 +193,14 @@ class Agent:
         self.messages = new_messages
 
         new_tokens = self._estimate_tokens()
-        print(
-            f"{Colors.BRIGHT_GREEN}✓ Summary completed, tokens reduced from {estimated_tokens} to {new_tokens}{Colors.RESET}"
-        )
-        print(
-            f"{Colors.DIM}  Structure: system + {len(user_indices)} user messages + {summary_count} summaries{Colors.RESET}"
-        )
+        print(f"{Colors.BRIGHT_GREEN}✓ Summary completed, tokens reduced from {estimated_tokens} to {new_tokens}{Colors.RESET}")
+        print(f"{Colors.DIM}  Structure: system + {len(user_indices)} user messages + {summary_count} summaries{Colors.RESET}")
 
-    async def _create_summary(self, messages: list[Message], user_idx: int, round_num: int) -> str:
+    async def _create_summary(self, messages: list[Message], round_num: int) -> str:
         """Create summary for one execution round
 
         Args:
             messages: List of messages to summarize
-            user_idx: Index of user message (unused but kept for compatibility)
             round_num: Round number
 
         Returns:
@@ -335,9 +333,7 @@ Requirements:
                 arguments = tool_call.function.arguments
 
                 # Tool call header
-                print(
-                    f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}"
-                )
+                print(f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}")
 
                 # Arguments (formatted display)
                 print(f"{Colors.DIM}   Arguments:{Colors.RESET}")
