@@ -38,8 +38,8 @@ class AnthropicClient(LLMClientBase):
         """
         super().__init__(api_key, api_base, model, retry_config)
 
-        # Initialize Anthropic client
-        self.client = anthropic.Anthropic(
+        # Initialize Anthropic async client
+        self.client = anthropic.AsyncAnthropic(
             base_url=api_base,
             api_key=api_key,
         )
@@ -75,8 +75,8 @@ class AnthropicClient(LLMClientBase):
         if tools:
             params["tools"] = self._convert_tools(tools)
 
-        # Use Anthropic SDK's messages.create
-        response = self.client.messages.create(**params)
+        # Use Anthropic SDK's async messages.create
+        response = await self.client.messages.create(**params)
         return response
 
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:

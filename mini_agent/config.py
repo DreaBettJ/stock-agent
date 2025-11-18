@@ -62,6 +62,16 @@ class Config(BaseModel):
     tools: ToolsConfig
 
     @classmethod
+    def load(cls) -> "Config":
+        """Load configuration from the default search path."""
+        config_path = cls.get_default_config_path()
+        if not config_path.exists():
+            raise FileNotFoundError(
+                "Configuration file not found. Run scripts/setup-config.sh or place config.yaml in mini_agent/config/."
+            )
+        return cls.from_yaml(config_path)
+
+    @classmethod
     def from_yaml(cls, config_path: str | Path) -> "Config":
         """Load configuration from YAML file
 
