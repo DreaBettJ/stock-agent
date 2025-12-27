@@ -83,7 +83,9 @@ def print_banner():
 
     print()
     print(f"{Colors.BOLD}{Colors.BRIGHT_CYAN}╔{'═' * BOX_WIDTH}╗{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.BRIGHT_CYAN}║{Colors.RESET}{' ' * left_padding}{banner_text}{' ' * right_padding}{Colors.BOLD}{Colors.BRIGHT_CYAN}║{Colors.RESET}")
+    print(
+        f"{Colors.BOLD}{Colors.BRIGHT_CYAN}║{Colors.RESET}{' ' * left_padding}{banner_text}{' ' * right_padding}{Colors.BOLD}{Colors.BRIGHT_CYAN}║{Colors.RESET}"
+    )
     print(f"{Colors.BOLD}{Colors.BRIGHT_CYAN}╚{'═' * BOX_WIDTH}╝{Colors.RESET}")
     print()
 
@@ -243,18 +245,22 @@ async def initialize_base_tools(config: Config):
         print(f"{Colors.BRIGHT_CYAN}Loading Claude Skills...{Colors.RESET}")
         try:
             # Resolve skills directory with priority search
-            skills_dir = config.tools.skills_dir
-            if not Path(skills_dir).is_absolute():
+            # Expand ~ to user home directory for portability
+            skills_path = Path(config.tools.skills_dir).expanduser()
+            if skills_path.is_absolute():
+                skills_dir = str(skills_path)
+            else:
                 # Search in priority order:
                 # 1. Current directory (dev mode: ./skills or ./mini_agent/skills)
                 # 2. Package directory (installed: site-packages/mini_agent/skills)
                 search_paths = [
-                    Path(skills_dir),  # ./skills for backward compatibility
-                    Path("mini_agent") / skills_dir,  # ./mini_agent/skills
-                    Config.get_package_dir() / skills_dir,  # site-packages/mini_agent/skills
+                    skills_path,  # ./skills for backward compatibility
+                    Path("mini_agent") / skills_path,  # ./mini_agent/skills
+                    Config.get_package_dir() / skills_path,  # site-packages/mini_agent/skills
                 ]
 
                 # Find first existing path
+                skills_dir = str(skills_path)  # default
                 for path in search_paths:
                     if path.exists():
                         skills_dir = str(path.resolve())
@@ -341,7 +347,9 @@ async def run_agent(workspace_dir: Path):
         print(f"  {Colors.DIM}3) <package>/config/config.yaml{Colors.RESET} (installed)")
         print()
         print(f"{Colors.BRIGHT_YELLOW}🚀 Quick Setup (Recommended):{Colors.RESET}")
-        print(f"  {Colors.BRIGHT_GREEN}curl -fsSL https://raw.githubusercontent.com/MiniMax-AI/Mini-Agent/main/scripts/setup-config.sh | bash{Colors.RESET}")
+        print(
+            f"  {Colors.BRIGHT_GREEN}curl -fsSL https://raw.githubusercontent.com/MiniMax-AI/Mini-Agent/main/scripts/setup-config.sh | bash{Colors.RESET}"
+        )
         print()
         print(f"{Colors.DIM}  This will automatically:{Colors.RESET}")
         print(f"{Colors.DIM}    • Create ~/.mini-agent/config/{Colors.RESET}")
@@ -583,8 +591,9 @@ def main():
     args = parse_args()
 
     # Determine workspace directory
+    # Expand ~ to user home directory for portability
     if args.workspace:
-        workspace_dir = Path(args.workspace).absolute()
+        workspace_dir = Path(args.workspace).expanduser().absolute()
     else:
         # Use current working directory
         workspace_dir = Path.cwd()
