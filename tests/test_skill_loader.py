@@ -244,3 +244,31 @@ Run the script: python scripts/test_script.py
 
         # Check that script path is converted to absolute
         assert str(skill_dir / "scripts" / "test_script.py") in skill.content
+
+
+def test_skill_to_prompt_includes_root_directory():
+    """Test that to_prompt includes skill root directory path"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        skill_dir = Path(tmpdir) / "test-skill"
+        skill_dir.mkdir()
+
+        skill_file = skill_dir / "SKILL.md"
+        skill_content = """---
+name: test-skill
+description: A test skill
+---
+
+Skill content here.
+"""
+        skill_file.write_text(skill_content, encoding="utf-8")
+
+        loader = SkillLoader(tmpdir)
+        skill = loader.load_skill(skill_file)
+
+        assert skill is not None
+
+        # Test to_prompt includes root directory
+        prompt = skill.to_prompt()
+        assert "Skill Root Directory" in prompt
+        assert str(skill_dir) in prompt
+        assert "All files and references in this skill are relative to this directory" in prompt

@@ -26,10 +26,17 @@ class Skill:
 
     def to_prompt(self) -> str:
         """Convert skill to prompt format"""
+        # Inject skill root directory path for context
+        skill_root = str(self.skill_path.parent) if self.skill_path else "unknown"
+
         return f"""
 # Skill: {self.name}
 
 {self.description}
+
+**Skill Root Directory:** `{skill_root}`
+
+All files and references in this skill are relative to this directory.
 
 ---
 
