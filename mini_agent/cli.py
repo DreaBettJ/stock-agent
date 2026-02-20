@@ -36,6 +36,7 @@ from mini_agent.tools.bash_tool import BashKillTool, BashOutputTool, BashTool
 from mini_agent.tools.file_tools import EditTool, ReadTool, WriteTool
 from mini_agent.tools.mcp_loader import cleanup_mcp_connections, load_mcp_tools_async, set_mcp_timeout_config
 from mini_agent.tools.note_tool import SessionNoteTool
+from mini_agent.tools.stock_tools import create_a_share_tools
 from mini_agent.tools.skill_tool import create_skill_tools
 from mini_agent.utils import calculate_display_width
 
@@ -348,10 +349,14 @@ async def initialize_base_tools(config: Config):
         Tuple of (list of tools, skill loader if skills enabled)
     """
 
+    # 学习提示：这里先加载“与工作目录无关”的工具。
+    # 例如 MCP/Skills 的连接与发现，不依赖当前 workspace。
     tools = []
     skill_loader = None
 
     # 1. Bash auxiliary tools (output monitoring and kill)
+    # 学习提示：真正执行命令的 BashTool 会在 add_workspace_tools() 里创建，
+    # 因为它需要绑定 cwd=workspace_dir。
     # Note: BashTool itself is created in add_workspace_tools() with workspace_dir as cwd
     if config.tools.enable_bash:
         bash_output_tool = BashOutputTool()
@@ -363,6 +368,7 @@ async def initialize_base_tools(config: Config):
         print(f"{Colors.GREEN}✅ Loaded Bash Kill tool{Colors.RESET}")
 
     # 3. Claude Skills (loaded from package directory)
+    # 学习提示：这里只注入技能“索引”和 get_skill 工具，完整技能内容按需加载。
     if config.tools.enable_skills:
         print(f"{Colors.BRIGHT_CYAN}Loading Claude Skills...{Colors.RESET}")
         try:
@@ -398,6 +404,7 @@ async def initialize_base_tools(config: Config):
             print(f"{Colors.YELLOW}⚠️  Failed to load Skills: {e}{Colors.RESET}")
 
     # 4. MCP tools (loaded with priority search)
+    # 学习提示：MCP 是外部工具协议层，这里负责连接并把远程工具适配成统一 Tool 接口。
     if config.tools.enable_mcp:
         print(f"{Colors.BRIGHT_CYAN}Loading MCP tools...{Colors.RESET}")
         try:
@@ -441,6 +448,8 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path):
         config: Configuration object
         workspace_dir: Workspace directory path
     """
+    # 学习提示：从这里开始，工具会感知“当前项目目录”。
+    # 这样 read/write/edit/bash 的相对路径都会落在 workspace 下。
     # Ensure workspace directory exists
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -466,6 +475,12 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path):
         tools.append(SessionNoteTool(memory_file=str(workspace_dir / ".agent_memory.json")))
         print(f"{Colors.GREEN}✅ Loaded session note tool{Colors.RESET}")
 
+    # A-share stock tools - selection/analysis/action planning skeleton
+    if config.tools.enable_stock_tools:
+        stock_tools = create_a_share_tools()
+        tools.extend(stock_tools)
+        print(f"{Colors.GREEN}✅ Loaded {len(stock_tools)} A-share stock tools (skeleton){Colors.RESET}")
+
 
 async def _quiet_cleanup():
     """Clean up MCP connections, suppressing noisy asyncgen teardown tracebacks."""
@@ -490,6 +505,9 @@ async def run_agent(workspace_dir: Path, task: str = None):
         workspace_dir: Workspace directory path
         task: If provided, execute this task and exit (non-interactive mode)
     """
+    # 学习提示：run_agent 是 CLI 的主编排函数，核心链路如下：
+    # 1) 读配置 -> 2) 初始化 LLM -> 3) 装配工具 -> 4) 构建 Agent
+    # 5) 进入非交互/交互模式 -> 6) 清理 MCP 连接
     session_start = datetime.now()
 
     # 1. Load configuration from package directory
@@ -536,6 +554,8 @@ async def run_agent(workspace_dir: Path, task: str = None):
         return
 
     # 2. Initialize LLM client
+    # 学习提示：Config 的 retry 字段会被转换成底层 retry 配置对象，
+    # 并通过回调把重试过程打印到终端。
     from mini_agent.retry import RetryConfig as RetryConfigBase
 
     # Convert configuration format
@@ -578,6 +598,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
     add_workspace_tools(tools, config, workspace_dir)
 
     # 5. Load System Prompt (with priority search)
+    # 学习提示：System Prompt 是 Agent 的“长期行为约束”。
     system_prompt_path = Config.find_config_file(config.agent.system_prompt_path)
     if system_prompt_path and system_prompt_path.exists():
         system_prompt = system_prompt_path.read_text(encoding="utf-8")
@@ -587,6 +608,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
         print(f"{Colors.YELLOW}⚠️  System prompt not found, using default{Colors.RESET}")
 
     # 6. Inject Skills Metadata into System Prompt (Progressive Disclosure - Level 1)
+    # 学习提示：这里只注入技能名称+描述，避免一次性把所有技能正文塞进上下文。
     if skill_loader:
         skills_metadata = skill_loader.get_skills_metadata_prompt()
         if skills_metadata:
@@ -607,6 +629,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
         tools=tools,
         max_steps=config.agent.max_steps,
         workspace_dir=str(workspace_dir),
+        enable_intercept_log=config.agent.enable_intercept_log,
     )
 
     # 8. Display welcome information
@@ -615,6 +638,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
         print_session_info(agent, workspace_dir, config.llm.model)
 
     # 8.5 Non-interactive mode: execute task and exit
+    # 学习提示：--task 会直接跑一次 agent.run() 然后退出，不进入 REPL 循环。
     if task:
         print(f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Executing task...{Colors.RESET}\n")
         agent.add_user_message(task)
@@ -676,6 +700,10 @@ async def run_agent(workspace_dir: Path, task: str = None):
     )
 
     # 10. Interactive loop
+    # 学习提示：这里是一个 REPL：
+    # - 先处理 /help /clear 等命令
+    # - 再把普通输入交给 Agent.run()
+    # - 每轮输入都共享同一个 agent.messages（多轮记忆）
     while True:
         try:
             # Get user input using prompt_toolkit
@@ -744,6 +772,8 @@ async def run_agent(workspace_dir: Path, task: str = None):
                 break
 
             # Run Agent with Esc cancellation support
+            # 学习提示：Esc 的取消不是强杀线程，而是设置 cancel_event。
+            # Agent 在安全检查点读取该事件，保证消息状态一致。
             print(
                 f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Thinking... (Esc to cancel){Colors.RESET}\n"
             )
@@ -759,6 +789,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
 
             def esc_key_listener():
                 """Listen for Esc key in a separate thread."""
+                # 学习提示：按键监听放在线程里，避免阻塞 asyncio 主事件循环。
                 if platform.system() == "Windows":
                     try:
                         import msvcrt
@@ -806,6 +837,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
             esc_thread.start()
 
             # Run agent with periodic cancellation check
+            # 学习提示：外层轮询负责把线程侧的“按下 Esc”同步到 asyncio.Event。
             try:
                 agent_task = asyncio.create_task(agent.run())
 
@@ -843,6 +875,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
 
 def main():
     """Main entry point for CLI"""
+    # 学习提示：main 很薄，只做参数解析、workspace 解析，然后把控制权交给 run_agent。
     # Parse command line arguments
     args = parse_args()
 

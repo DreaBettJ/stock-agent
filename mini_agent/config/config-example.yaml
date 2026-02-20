@@ -37,6 +37,7 @@ retry:
 max_steps: 100  # Maximum execution steps
 workspace_dir: "./workspace"  # Working directory
 system_prompt_path: "system_prompt.md"  # System prompt file (same config directory)
+enable_intercept_log: true  # Enable minimal interception event log (.jsonl)
 
 # ===== Tools Configuration =====
 tools:
@@ -44,6 +45,7 @@ tools:
   enable_file_tools: true  # File read/write/edit tools (ReadTool, WriteTool, EditTool)
   enable_bash: true        # Bash command execution tool
   enable_note: true        # Session note tool (SessionNoteTool)
+  enable_stock_tools: true # A-share stock tools (screen/quote/fundamentals/news/trade-plan skeleton)
   
   # Claude Skills
   enable_skills: true      # Enable Skills

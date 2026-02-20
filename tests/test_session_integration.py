@@ -2,6 +2,7 @@
 Session integration tests - Testing multi-turn conversations and session management
 """
 
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,7 +11,7 @@ import pytest
 
 from mini_agent import LLMClient
 from mini_agent.agent import Agent
-from mini_agent.schema import LLMResponse, Message
+from mini_agent.schema import LLMResponse, Message, TokenUsage
 from mini_agent.tools.bash_tool import BashTool
 from mini_agent.tools.file_tools import ReadTool, WriteTool
 from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
@@ -169,3 +170,42 @@ def test_message_statistics(mock_llm_client, temp_workspace):
     assert assistant_msgs == 1
     assert tool_msgs == 1
     assert len(agent.messages) == 5  # 1 system + 2 user + 1 assistant + 1 tool
+
+
+@pytest.mark.asyncio
+async def test_intercept_log_generation(monkeypatch, temp_workspace):
+    """Test interception event JSONL is generated and contains core events."""
+    monkeypatch.setenv("HOME", temp_workspace)
+
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.generate = AsyncMock(
+        return_value=LLMResponse(
+            content="done",
+            finish_reason="stop",
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        )
+    )
+
+    agent = Agent(
+        llm_client=mock_llm,
+        system_prompt="System",
+        tools=[],
+        workspace_dir=temp_workspace,
+        enable_intercept_log=True,
+    )
+    agent.add_user_message("say hi")
+    result = await agent.run()
+    assert result == "done"
+
+    intercept_path = agent.logger.get_intercept_log_file_path()
+    assert intercept_path is not None
+    assert intercept_path.exists()
+
+    events = []
+    for line in intercept_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            events.append(json.loads(line))
+
+    event_names = {item["event"] for item in events}
+    assert "before_send" in event_names
+    assert "after_response" in event_names

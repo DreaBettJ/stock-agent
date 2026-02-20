@@ -16,22 +16,30 @@ class AgentLogger:
     - Tool calls and results
     """
 
-    def __init__(self):
+    def __init__(self, enabled: bool = True):
         """Initialize logger
 
         Logs are stored in ~/.mini-agent/log/ directory
         """
+        self.enabled = enabled
         # Use ~/.mini-agent/log/ directory for logs
         self.log_dir = Path.home() / ".mini-agent" / "log"
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        if self.enabled:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = None
+        self.intercept_log_file = None
         self.log_index = 0
 
     def start_new_run(self):
         """Start new run, create new log file"""
+        if not self.enabled:
+            return
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_filename = f"agent_run_{timestamp}.log"
+        intercept_filename = f"agent_intercept_{timestamp}.jsonl"
         self.log_file = self.log_dir / log_filename
+        self.intercept_log_file = self.log_dir / intercept_filename
         self.log_index = 0
 
         # Write log header
@@ -39,6 +47,20 @@ class AgentLogger:
             f.write("=" * 80 + "\n")
             f.write(f"Agent Run Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 80 + "\n\n")
+
+    def log_intercept_event(self, event: str, data: dict[str, Any]):
+        """Log one interception event as a single JSONL line."""
+        if not self.enabled or self.intercept_log_file is None:
+            return
+
+        event_data: dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "event": event,
+        }
+        event_data.update(data)
+
+        with open(self.intercept_log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event_data, ensure_ascii=False) + "\n")
 
     def log_request(self, messages: list[Message], tools: list[Any] | None = None):
         """Log LLM request
@@ -163,7 +185,7 @@ class AgentLogger:
             log_type: Log type (REQUEST, RESPONSE, TOOL_RESULT)
             content: Log content
         """
-        if self.log_file is None:
+        if not self.enabled or self.log_file is None:
             return
 
         with open(self.log_file, "a", encoding="utf-8") as f:
@@ -176,3 +198,7 @@ class AgentLogger:
     def get_log_file_path(self) -> Path:
         """Get current log file path"""
         return self.log_file
+
+    def get_intercept_log_file_path(self) -> Path:
+        """Get current interception log file path"""
+        return self.intercept_log_file

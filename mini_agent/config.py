@@ -35,6 +35,7 @@ class AgentConfig(BaseModel):
     max_steps: int = 50
     workspace_dir: str = "./workspace"
     system_prompt_path: str = "system_prompt.md"
+    enable_intercept_log: bool = True
 
 
 class MCPConfig(BaseModel):
@@ -52,6 +53,7 @@ class ToolsConfig(BaseModel):
     enable_file_tools: bool = True
     enable_bash: bool = True
     enable_note: bool = True
+    enable_stock_tools: bool = True
 
     # Skills
     enable_skills: bool = True
@@ -133,6 +135,7 @@ class Config(BaseModel):
             max_steps=data.get("max_steps", 50),
             workspace_dir=data.get("workspace_dir", "./workspace"),
             system_prompt_path=data.get("system_prompt_path", "system_prompt.md"),
+            enable_intercept_log=data.get("enable_intercept_log", True),
         )
 
         # Parse tools configuration
@@ -150,6 +153,7 @@ class Config(BaseModel):
             enable_file_tools=tools_data.get("enable_file_tools", True),
             enable_bash=tools_data.get("enable_bash", True),
             enable_note=tools_data.get("enable_note", True),
+            enable_stock_tools=tools_data.get("enable_stock_tools", True),
             enable_skills=tools_data.get("enable_skills", True),
             skills_dir=tools_data.get("skills_dir", "./skills"),
             enable_mcp=tools_data.get("enable_mcp", True),
