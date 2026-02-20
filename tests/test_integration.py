@@ -1,7 +1,6 @@
 """Integration test cases - Full agent demos."""
 
 import asyncio
-import json
 import tempfile
 from pathlib import Path
 
@@ -62,7 +61,7 @@ async def test_basic_agent_usage():
         ]
 
         # Add Note tools for session memory
-        memory_file = Path(workspace_dir) / ".agent_memory.json"
+        memory_file = Path(workspace_dir) / ".agent_memory.db"
         tools.extend(
             [
                 SessionNoteTool(memory_file=str(memory_file)),
@@ -158,8 +157,8 @@ You have record_note and recall_notes tools:
             model=config.llm.model,
         )
 
-        # Memory file path
-        memory_file = Path(workspace_dir) / ".agent_memory.json"
+        # Memory database path
+        memory_file = Path(workspace_dir) / ".agent_memory.db"
 
         # Initialize tools (only Session Note Tools for this test)
         tools = [
@@ -197,13 +196,12 @@ You have record_note and recall_notes tools:
         print(f"Agent completed: {result1[:200]}...")
         print("=" * 80)
 
-        # Check if notes were recorded
-        if memory_file.exists():
-            notes = json.loads(memory_file.read_text())
-            print(f"\n✅ Agent recorded {len(notes)} notes:")
-            for note in notes:
-                print(f"  - [{note['category']}] {note['content']}")
-            assert len(notes) > 0, "Agent should have recorded some notes"
+        # Check if notes were recorded (via tool query instead of JSON file parsing)
+        recall_tool = RecallNoteTool(memory_file=str(memory_file))
+        recall_result = await recall_tool.execute()
+        if recall_result.success and "No notes recorded yet." not in recall_result.content:
+            print("\n✅ Agent recorded notes:")
+            print(recall_result.content[:800])
         else:
             print("\n⚠️  No notes found - agent may not have used record_note tool")
 

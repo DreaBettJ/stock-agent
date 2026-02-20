@@ -13,7 +13,7 @@
   测试位于 tests/（单元 + 集成），文档位于 docs/，可运行示例位于 examples/，初始化辅助脚本位于 scripts/。
 
   ## 构建、测试与开发命令
-
+- MINI_AGENT_LOG_LEVEL=INFO uv run python -m mini_agent.cli 带日志测试
 - uv sync：根据 pyproject.toml/uv.lock 安装项目及开发依赖。
 - uv run python -m mini_agent.cli：在本地开发模式运行 CLI。
 - uv run pytest tests/ -v：运行完整测试套件。
