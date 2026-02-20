@@ -12,6 +12,8 @@ Examples:
 
 import argparse
 import asyncio
+import logging
+import os
 import platform
 import subprocess
 import sys
@@ -19,6 +21,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List
+from uuid import uuid4
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -35,8 +38,9 @@ from mini_agent.tools.base import Tool
 from mini_agent.tools.bash_tool import BashKillTool, BashOutputTool, BashTool
 from mini_agent.tools.file_tools import EditTool, ReadTool, WriteTool
 from mini_agent.tools.mcp_loader import cleanup_mcp_connections, load_mcp_tools_async, set_mcp_timeout_config
-from mini_agent.tools.note_tool import SessionNoteTool
+from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
 from mini_agent.tools.stock_tools import create_a_share_tools
+from mini_agent.tools.trade_tool import create_trade_tools
 from mini_agent.tools.skill_tool import create_skill_tools
 from mini_agent.utils import calculate_display_width
 
@@ -79,6 +83,16 @@ class Colors:
 def get_log_directory() -> Path:
     """Get the log directory path."""
     return Path.home() / ".mini-agent" / "log"
+
+
+def setup_logging() -> None:
+    """Initialize process logging for tool/backend diagnostics."""
+    level_name = os.getenv("MINI_AGENT_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
 
 
 def show_log_directory(open_file_manager: bool = True) -> None:
@@ -438,7 +452,7 @@ async def initialize_base_tools(config: Config):
     return tools, skill_loader
 
 
-def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path):
+def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, session_id: str):
     """Add workspace-dependent tools
 
     These tools need to know the workspace directory.
@@ -447,6 +461,7 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path):
         tools: Existing tools list to add to
         config: Configuration object
         workspace_dir: Workspace directory path
+        session_id: Current runtime session identifier
     """
     # 学习提示：从这里开始，工具会感知“当前项目目录”。
     # 这样 read/write/edit/bash 的相对路径都会落在 workspace 下。
@@ -472,14 +487,25 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path):
 
     # Session note tool - needs workspace to store memory file
     if config.tools.enable_note:
-        tools.append(SessionNoteTool(memory_file=str(workspace_dir / ".agent_memory.json")))
-        print(f"{Colors.GREEN}✅ Loaded session note tool{Colors.RESET}")
+        memory_db = str(workspace_dir / ".agent_memory.db")
+        tools.append(SessionNoteTool(memory_file=memory_db, session_id=session_id))
+        tools.append(RecallNoteTool(memory_file=memory_db, session_id=session_id))
+        print(f"{Colors.GREEN}✅ Loaded session note tools (SQLite, session_id: {session_id}){Colors.RESET}")
 
     # A-share stock tools - selection/analysis/action planning skeleton
     if config.tools.enable_stock_tools:
         stock_tools = create_a_share_tools()
         tools.extend(stock_tools)
         print(f"{Colors.GREEN}✅ Loaded {len(stock_tools)} A-share stock tools (skeleton){Colors.RESET}")
+
+    # Trade record tools - for recording buy/sell operations
+    # Check if enable_trade_tools exists (added in config.yaml) or default to True
+    enable_trade = getattr(config.tools, "enable_trade_tools", True)
+    if enable_trade:
+        memory_db = str(workspace_dir / ".agent_memory.db")
+        trade_tools = create_trade_tools(memory_file=memory_db, session_id=session_id)
+        tools.extend(trade_tools)
+        print(f"{Colors.GREEN}✅ Loaded {len(trade_tools)} trade tools (SQLite){Colors.RESET}")
 
 
 async def _quiet_cleanup():
@@ -509,6 +535,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # 1) 读配置 -> 2) 初始化 LLM -> 3) 装配工具 -> 4) 构建 Agent
     # 5) 进入非交互/交互模式 -> 6) 清理 MCP 连接
     session_start = datetime.now()
+    session_id = uuid4().hex
 
     # 1. Load configuration from package directory
     config_path = Config.get_default_config_path()
@@ -595,7 +622,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
     tools, skill_loader = await initialize_base_tools(config)
 
     # 4. Add workspace-dependent tools
-    add_workspace_tools(tools, config, workspace_dir)
+    add_workspace_tools(tools, config, workspace_dir, session_id=session_id)
 
     # 5. Load System Prompt (with priority search)
     # 学习提示：System Prompt 是 Agent 的“长期行为约束”。
@@ -875,6 +902,8 @@ async def run_agent(workspace_dir: Path, task: str = None):
 
 def main():
     """Main entry point for CLI"""
+    setup_logging()
+
     # 学习提示：main 很薄，只做参数解析、workspace 解析，然后把控制权交给 run_agent。
     # Parse command line arguments
     args = parse_args()
