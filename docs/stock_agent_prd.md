@@ -317,7 +317,7 @@ Tool: calculate_profit
 | AShareFundamentalsTool | 基本面数据 | ticker, timestamp, period |
 | AShareScreenTool | 选股筛选 | strategy, timestamp, max_results |
 
-> 注：暂不包含新闻工具（散户获取新闻存在信息差劣势）
+> 注：实时新闻监听已移除。Agent 可通过 MCP Minimax 主动搜索相关新闻作为参考
 
 ### 4.2 交易工具（已有/需扩展）
 
