@@ -38,8 +38,7 @@
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐        │
 │  │ 股票查询工具 │ │ 交易记录工具 │ │  数据同步    │        │
 │  │ - 行情      │ │ - 买入/卖出  │ │  - 日线数据 │        │
-│  │ - 基本面    │ │ - 持仓查询   │ │  - 基本面   │        │
-│  │ - 选股      │ │ - 历史记录   │ │  - 北向资金 │        │
+│  │ - 选股      │ │ - 持仓查询   │ │              │        │
 │  │              │ │ - 盈利计算   │ │              │        │
 │  └──────────────┘ └──────────────┘ └──────────────┘        │
 └─────────────────────────────────────────────────────────────┘
@@ -314,7 +313,6 @@ Tool: calculate_profit
 | Tool | 功能 | 参数 |
 |------|------|------|
 | AShareQuoteTool | 实时行情 | ticker, timestamp |
-| AShareFundamentalsTool | 基本面数据 | ticker, timestamp, period |
 | AShareScreenTool | 选股筛选 | strategy, timestamp, max_results |
 
 > 注：实时新闻监听已移除。Agent 可通过 MCP Minimax 主动搜索相关新闻作为参考
@@ -332,19 +330,13 @@ Tool: calculate_profit
 
 | Tool | 功能 | 参数 |
 |------|------|------|
-| MarketSummaryTool | 市场总览 | timestamp |
 | TopGainersTool | 涨幅榜 | timestamp, limit |
-| SectorAnalysisTool | 板块分析 | timestamp |
-| MainlineAnalysisTool | 主线分析 | timestamp |
 
 ### 4.4 数据同步
 
 | 数据 | 来源 | 同步频率 |
 |------|------|----------|
 | 日线数据 | 腾讯财经API / AkShare | 每日收盘后 |
-| 基本面 | AkShare | 每周 |
-| 北向资金 | AkShare | 每日 |
-| 龙虎榜 | AkShare | 每日 |
 
 ---
 
@@ -431,7 +423,6 @@ CREATE INDEX idx_kline_date ON daily_kline(date);
 |------|----------|
 | 日线数据 | 查询历史K线返回正确数据 |
 | 实时行情 | 盘中日线、涨跌幅正确 |
-| 基本面 | PE、ROE 等指标正确 |
 
 ---
 
@@ -449,7 +440,6 @@ CREATE INDEX idx_kline_date ON daily_kline(date);
 
 ### Phase 3: 数据完善（1周）
 - [ ] 日线数据同步
-- [ ] 基本面数据同步
 - [ ] 主线分析逻辑
 
 ### Phase 4: 优化（持续）
