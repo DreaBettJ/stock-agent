@@ -70,9 +70,119 @@
 
 ---
 
-## 5. 数据存储
+## 5. 模拟交易（可选）
 
-### 5.1 记忆表（逻辑删除）
+### 5.1 模式说明
+
+| 模式 | 说明 |
+|------|------|
+| **模拟模式** | 用虚拟资金交易，不涉及真实账户 |
+| **实盘模式** | 仅给出建议，人确认后执行 |
+
+### 5.2 模拟交易规则
+
+- 初始虚拟资金：10 万元
+- 买入规则：次日开盘价成交
+- 卖出规则：次日开盘价成交
+- 手续费：万三（模拟）
+- 印花税：千一（卖出模拟）
+
+### 5.3 模拟交易工具
+
+```python
+class SimulateTradeTool(Tool):
+    """模拟交易工具"""
+    
+    name = "simulate_trade"
+    
+    async def execute(self, action: str, ticker: str, quantity: int, price: float = None) -> ToolResult:
+        """
+        模拟买入/卖出
+        action: "buy" 或 "sell"
+        ticker: 股票代码
+        quantity: 数量
+        price: 价格（可选，不填则用次日开盘价）
+        """
+        # 检查资金是否充足
+        # 记录模拟交易
+        # 更新模拟持仓
+```
+
+### 5.4 模拟持仓
+
+```sql
+CREATE TABLE sim_positions (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    quantity INT,
+    avg_cost REAL,        -- 平均成本
+    created_at DATETIME,
+    updated_at DATETIME
+);
+```
+
+### 5.5 模拟账户
+
+```sql
+CREATE TABLE sim_account (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT UNIQUE NOT NULL,
+    initial_capital REAL DEFAULT 100000,  -- 初始资金
+    current_cash REAL,                    -- 当前现金
+    created_at DATETIME,
+    updated_at DATETIME
+);
+```
+
+### 5.6 模拟交易记录
+
+```sql
+CREATE TABLE sim_trades (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    action TEXT NOT NULL,     -- buy/sell
+    price REAL,
+    quantity INT,
+    amount REAL,              -- 成交金额
+    fee REAL,                 -- 手续费
+    profit REAL,              -- 盈亏（仅卖出）
+    timestamp DATETIME,
+    created_at DATETIME
+);
+```
+
+### 5.7 模拟盈利计算
+
+```python
+async def calculate_sim_profit(session_id: str) -> dict:
+    """计算模拟盈利"""
+    # 当前持仓市值
+    position_value = sum(quantity * current_price for each position)
+    
+    # 总资产 = 现金 + 持仓市值
+    total = current_cash + position_value
+    
+    # 盈利 = 总资产 - 初始资金
+    profit = total - initial_capital
+    profit_rate = profit / initial_capital
+    
+    return {
+        "initial_capital": 100000,
+        "current_cash": current_cash,
+        "position_value": position_value,
+        "total_assets": total,
+        "profit": profit,
+        "profit_rate": profit_rate
+    }
+```
+
+---
+
+## 6. 数据存储
+
+### 6.1 记忆表（逻辑删除）
 
 ```sql
 CREATE TABLE memories (
@@ -118,7 +228,7 @@ CREATE TABLE daily_kline (
 
 ---
 
-## 6. Session 管理
+## 7. Session 管理
 
 - 外部传入 session_id
 - 启动时加载未删除的记忆（is_deleted=0）
@@ -126,7 +236,7 @@ CREATE TABLE daily_kline (
 
 ---
 
-## 7. Cron 配置
+## 8. Cron 配置
 
 | 任务 | 时间 | 说明 |
 |------|------|------|
@@ -135,7 +245,7 @@ CREATE TABLE daily_kline (
 
 ---
 
-## 8. 实施计划
+## 9. 实施计划
 
 ### Phase 1: 基础能力
 - [ ] session_id 传入
@@ -151,7 +261,7 @@ CREATE TABLE daily_kline (
 
 ---
 
-## 9. 附录
+## 10. 附录
 
 ### 提示词示例
 
