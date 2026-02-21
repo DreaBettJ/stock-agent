@@ -120,10 +120,25 @@ class SimulateTradeTool(Tool):
     COMMISSION_RATE = 0.0003
     STAMP_DUTY_RATE = 0.001
 
-    def __init__(self, db_path: str = "./workspace/.agent_memory.db"):
+    def __init__(
+        self,
+        db_path: str = "./workspace/.agent_memory.db",
+        kline_db_path: str = None,
+    ):
         self.db_path = db_path
         self.session_manager = SessionManager(db_path=db_path)
-        self.kline_db = KLineDB(db_path=db_path)
+        # K-line data is in separate database
+        if kline_db_path:
+            self.kline_db = KLineDB(db_path=kline_db_path)
+        else:
+            # Try to find kline DB in common locations
+            import os
+            workspace = os.path.dirname(os.path.abspath(db_path))
+            default_kline = os.path.join(workspace, "stock_kline.db")
+            if os.path.exists(default_kline):
+                self.kline_db = KLineDB(db_path=default_kline)
+            else:
+                self.kline_db = KLineDB(db_path=db_path)
         self.store = _SimTradeStore(db_path=db_path)
 
     @property

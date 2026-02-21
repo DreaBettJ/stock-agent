@@ -387,7 +387,11 @@ def _read_realized_profit(db_path: Path, session_id: str) -> float:
 def handle_trade_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle trade subcommands."""
     db_path = get_memory_db_path(workspace_dir)
-    trade_tool = SimulateTradeTool(db_path=str(db_path))
+    kline_db_path = workspace_dir / "stock_kline.db"
+    trade_tool = SimulateTradeTool(
+        db_path=str(db_path),
+        kline_db_path=str(kline_db_path) if kline_db_path.exists() else None,
+    )
 
     if args.trade_command in {"buy", "sell"}:
         result = asyncio.run(
@@ -534,6 +538,84 @@ def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle event subcommands."""
     if args.event_command != "trigger":
         return
+
+    # Auto trading mode
+    if args.auto:
+        if not args.session_id:
+            print(f"{Colors.RED}❌ --auto requires --session{Colors.RESET}")
+            return
+        
+        print(f"{Colors.CYAN}🤖 Auto trading mode{Colors.RESET}")
+        
+        from .auto_trading import AutoTradingWorkflow
+        
+        # Load API key from config.yaml
+        api_key = None
+        config_path = Path(__file__).parent / "config.yaml"
+        if config_path.exists():
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f)
+                api_key = cfg.get("api_key")
+        
+        db_path = get_memory_db_path(workspace_dir)
+        kline_db_path = workspace_dir / "stock_kline.db"
+        
+        if not kline_db_path.exists():
+            print(f"{Colors.RED}❌ K-line database not found{Colors.RESET}")
+            return
+        
+        session_manager = SessionManager(db_path=str(db_path))
+        kline_db = KLineDB(db_path=str(kline_db_path))
+        
+        workflow = AutoTradingWorkflow(
+            session_manager=session_manager,
+            kline_db=kline_db,
+            api_key=api_key,
+        )
+        
+        print(f"session: {args.session_id}")
+        
+        result = asyncio.run(workflow.trigger_daily_review(args.session_id))
+        
+        print(f"\n{Colors.BOLD}Agent Analysis:{Colors.RESET}")
+        print(result["agent_analysis"])
+        
+        if result["trade_signal"]:
+            signal = result["trade_signal"]
+            print(f"\n{Colors.GREEN}📊 Trade Signal:{Colors.RESET}")
+            print(f"  action: {signal['action']}")
+            print(f"  ticker: {signal['ticker']}")
+            print(f"  quantity: {signal['quantity']}")
+            
+            # Auto execute trade
+            print(f"\n{Colors.YELLOW}⚡ Executing trade...{Colors.RESET}")
+            from .tools.sim_trade_tool import SimulateTradeTool
+            
+            trade_tool = SimulateTradeTool(
+                db_path=str(db_path),
+                kline_db_path=str(kline_db_path),
+            )
+            
+            exec_result = asyncio.run(trade_tool.execute(
+                session_id=args.session_id,
+                action=signal["action"],
+                ticker=signal["ticker"],
+                quantity=signal["quantity"],
+                trade_date=result["date"],
+            ))
+            
+            if exec_result.success:
+                print(f"{Colors.GREEN}✅ Trade executed!{Colors.RESET}")
+                print(exec_result.content)
+            else:
+                print(f"{Colors.RED}❌ Trade failed: {exec_result.error}{Colors.RESET}")
+        else:
+            print(f"\n{Colors.DIM}No trade signal{Colors.RESET}")
+        
+        return
+
+    # Normal event trigger (non-auto)
 
     event = {"type": args.event_type, "triggered_at": datetime.now().isoformat()}
     if args.payload:
@@ -713,6 +795,7 @@ Examples:
 
     event_trigger = event_subparsers.add_parser("trigger", help="Trigger one event")
     event_trigger.add_argument("event_type", help="Event type, e.g. daily_review")
+    event_trigger.add_argument("--auto", action="store_true", help="Auto trading: trigger agent analysis + execute trade")
     target_group = event_trigger.add_mutually_exclusive_group(required=True)
     target_group.add_argument("--all", action="store_true", dest="all_sessions", help="Trigger all listening sessions")
     target_group.add_argument("--session", dest="session_id", help="Trigger a specific session")
