@@ -12,9 +12,11 @@ Examples:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import platform
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -33,15 +35,19 @@ from prompt_toolkit.styles import Style
 from mini_agent import LLMClient
 from mini_agent.agent import Agent
 from mini_agent.config import Config
+from mini_agent.event_broadcaster import EventBroadcaster
 from mini_agent.schema import LLMProvider
+from mini_agent.session import SessionManager
 from mini_agent.tools.base import Tool
 from mini_agent.tools.bash_tool import BashKillTool, BashOutputTool, BashTool
 from mini_agent.tools.file_tools import EditTool, ReadTool, WriteTool
 from mini_agent.tools.mcp_loader import cleanup_mcp_connections, load_mcp_tools_async, set_mcp_timeout_config
 from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
+from mini_agent.tools.sim_trade_tool import SimulateTradeTool
 from mini_agent.tools.stock_tools import create_a_share_tools
 from mini_agent.tools.trade_tool import create_trade_tools
 from mini_agent.tools.skill_tool import create_skill_tools
+from mini_agent.tools.kline_db_tool import KLineDB
 from mini_agent.utils import calculate_display_width
 
 
@@ -297,6 +303,213 @@ def print_stats(agent: Agent, session_start: datetime):
     print(f"{Colors.DIM}{'─' * 40}{Colors.RESET}\n")
 
 
+def get_memory_db_path(workspace_dir: Path) -> Path:
+    """Get SQLite db path under workspace."""
+    return workspace_dir / ".agent_memory.db"
+
+
+def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> None:
+    """Handle session subcommands."""
+    manager = SessionManager(db_path=str(get_memory_db_path(workspace_dir)))
+
+    if args.session_command == "create":
+        session_id = manager.create_session(
+            name=args.name,
+            system_prompt=args.prompt,
+            mode=args.mode,
+            initial_capital=args.initial_capital,
+            event_filter=args.event_filter or [],
+        )
+        print(f"{Colors.GREEN}✅ Session created{Colors.RESET}")
+        print(f"session_id: {session_id}")
+        print(f"name: {args.name}")
+        print(f"mode: {args.mode}")
+        print(f"initial_capital: {args.initial_capital:.2f}")
+        return
+
+    if args.session_command == "list":
+        sessions = manager.list_sessions()
+        if not sessions:
+            print(f"{Colors.YELLOW}No sessions found.{Colors.RESET}")
+            return
+        print("session_id\tname\tmode\tstatus\tlistening")
+        for session in sessions:
+            short_id = session.session_id[:8]
+            listening = "yes" if session.is_listening else "no"
+            print(f"{short_id}\t{session.name}\t{session.mode}\t{session.status}\t{listening}")
+        return
+
+    try:
+        if args.session_command == "start":
+            manager.start_session(args.session_id)
+            print(f"{Colors.GREEN}✅ Session started: {args.session_id}{Colors.RESET}")
+        elif args.session_command == "stop":
+            manager.stop_session(args.session_id)
+            print(f"{Colors.GREEN}✅ Session stopped: {args.session_id}{Colors.RESET}")
+        elif args.session_command == "delete":
+            manager.delete_session(args.session_id)
+            print(f"{Colors.GREEN}✅ Session deleted: {args.session_id}{Colors.RESET}")
+    except KeyError as exc:
+        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
+
+
+def _read_sim_positions(db_path: Path, session_id: str) -> list[sqlite3.Row]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT ticker, quantity, avg_cost
+                FROM sim_positions
+                WHERE session_id = ?
+                ORDER BY ticker
+                """,
+                (session_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    return list(rows)
+
+
+def _read_realized_profit(db_path: Path, session_id: str) -> float:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(profit), 0) AS realized FROM sim_trades WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return 0.0
+    return float(row["realized"] if row else 0.0)
+
+
+def handle_trade_command(args: argparse.Namespace, workspace_dir: Path) -> None:
+    """Handle trade subcommands."""
+    db_path = get_memory_db_path(workspace_dir)
+    trade_tool = SimulateTradeTool(db_path=str(db_path))
+
+    if args.trade_command in {"buy", "sell"}:
+        result = asyncio.run(
+            trade_tool.execute(
+                session_id=args.session_id,
+                action=args.trade_command,
+                ticker=args.ticker,
+                quantity=args.quantity,
+                trade_date=args.trade_date,
+            )
+        )
+        if result.success:
+            print(f"{Colors.GREEN}{result.content}{Colors.RESET}")
+        else:
+            print(f"{Colors.RED}❌ {result.error}{Colors.RESET}")
+        return
+
+    try:
+        session = trade_tool.session_manager.get_session(args.session_id)
+    except KeyError as exc:
+        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
+        return
+
+    positions = _read_sim_positions(db_path=db_path, session_id=args.session_id)
+
+    if args.trade_command == "positions":
+        if not positions:
+            print("No open positions.")
+            return
+        print(f"session: {args.session_id}")
+        print(f"cash: {session.current_cash:.2f}")
+        print("ticker\tquantity\tavg_cost")
+        for row in positions:
+            print(f"{row['ticker']}\t{int(row['quantity'])}\t{float(row['avg_cost']):.3f}")
+        return
+
+    if args.trade_command == "profit":
+        kline_db = KLineDB(db_path=str(db_path))
+        realized = _read_realized_profit(db_path=db_path, session_id=args.session_id)
+        unrealized = 0.0
+        market_value = 0.0
+        missing_prices: list[str] = []
+
+        for row in positions:
+            ticker = str(row["ticker"])
+            quantity = int(row["quantity"])
+            avg_cost = float(row["avg_cost"])
+            try:
+                latest = kline_db.get_latest_price(ticker)
+            except KeyError:
+                missing_prices.append(ticker)
+                continue
+            market_value += latest * quantity
+            unrealized += (latest - avg_cost) * quantity
+
+        total_assets = session.current_cash + market_value
+        total_profit = total_assets - session.initial_capital
+        total_return_pct = (total_profit / session.initial_capital * 100) if session.initial_capital else 0.0
+
+        print(f"session: {args.session_id}")
+        print(f"initial_capital: {session.initial_capital:.2f}")
+        print(f"cash: {session.current_cash:.2f}")
+        print(f"market_value: {market_value:.2f}")
+        print(f"realized_profit: {realized:.2f}")
+        print(f"unrealized_profit: {unrealized:.2f}")
+        print(f"total_profit: {total_profit:.2f}")
+        print(f"total_return: {total_return_pct:.2f}%")
+        if missing_prices:
+            print(
+                f"{Colors.YELLOW}⚠️ Missing latest price for: {', '.join(missing_prices)}; "
+                f"their unrealized pnl is excluded.{Colors.RESET}"
+            )
+
+
+async def _default_event_trigger(session, event: dict) -> str:
+    """Default event callback used by CLI trigger command."""
+    return f"TRIGGERED session={session.session_id} event={event.get('type')}"
+
+
+def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
+    """Handle event subcommands."""
+    if args.event_command != "trigger":
+        return
+
+    event = {"type": args.event_type, "triggered_at": datetime.now().isoformat()}
+    if args.payload:
+        try:
+            payload = json.loads(args.payload)
+        except json.JSONDecodeError as exc:
+            print(f"{Colors.RED}❌ Invalid JSON payload: {exc}{Colors.RESET}")
+            return
+        if not isinstance(payload, dict):
+            print(f"{Colors.RED}❌ --payload must be a JSON object{Colors.RESET}")
+            return
+        event.update(payload)
+
+    manager = SessionManager(db_path=str(get_memory_db_path(workspace_dir)))
+
+    if args.all_sessions:
+        broadcaster = EventBroadcaster(session_manager=manager, trigger=_default_event_trigger)
+        results = asyncio.run(broadcaster.broadcast(event))
+        print(f"event_type: {args.event_type}")
+        print(f"matched_sessions: {len(results)}")
+        for item in results:
+            sid = item["session_id"]
+            status = "ok" if item.get("success") else "failed"
+            detail = item.get("result") or item.get("error", "")
+            print(f"- {sid}: {status} {detail}")
+        return
+
+    try:
+        session = manager.get_session(args.session_id)
+    except KeyError as exc:
+        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
+        return
+
+    result = asyncio.run(_default_event_trigger(session, event))
+    print(f"event_type: {args.event_type}")
+    print(f"session: {args.session_id}")
+    print(result)
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments
 
@@ -312,6 +525,9 @@ Examples:
   mini-agent --workspace /path/to/dir     # Use specific workspace directory
   mini-agent log                          # Show log directory and recent files
   mini-agent log agent_run_xxx.log        # Read a specific log file
+  mini-agent session create --name test --prompt "..." --mode simulation
+  mini-agent trade buy 600519 100 --session <id>
+  mini-agent event trigger daily_review --all
         """,
     )
     parser.add_argument(
@@ -346,6 +562,86 @@ Examples:
         default=None,
         help="Log filename to read (optional, shows directory if omitted)",
     )
+
+    # session subcommands
+    session_parser = subparsers.add_parser("session", help="Manage experiment sessions")
+    session_subparsers = session_parser.add_subparsers(dest="session_command", help="Session actions")
+
+    session_create = session_subparsers.add_parser("create", help="Create a session")
+    session_create.add_argument("--name", required=True, help="Session name")
+    session_create.add_argument("--prompt", required=True, help="System prompt")
+    session_create.add_argument(
+        "--mode",
+        default="simulation",
+        choices=["simulation", "backtest"],
+        help="Session mode",
+    )
+    session_create.add_argument(
+        "--initial-capital",
+        type=float,
+        default=100000.0,
+        help="Initial capital",
+    )
+    session_create.add_argument(
+        "--event-filter",
+        nargs="*",
+        default=[],
+        help="Optional event types this session listens to",
+    )
+
+    session_subparsers.add_parser("list", help="List sessions")
+
+    session_start = session_subparsers.add_parser("start", help="Start one session")
+    session_start.add_argument("session_id", help="Session ID")
+
+    session_stop = session_subparsers.add_parser("stop", help="Stop one session")
+    session_stop.add_argument("session_id", help="Session ID")
+
+    session_delete = session_subparsers.add_parser("delete", help="Delete one session")
+    session_delete.add_argument("session_id", help="Session ID")
+
+    # trade subcommands
+    trade_parser = subparsers.add_parser("trade", help="Simulation trade commands")
+    trade_subparsers = trade_parser.add_subparsers(dest="trade_command", help="Trade actions")
+
+    trade_buy = trade_subparsers.add_parser("buy", help="Buy one ticker")
+    trade_buy.add_argument("ticker", help="Ticker")
+    trade_buy.add_argument("quantity", type=int, help="Quantity")
+    trade_buy.add_argument("--session", required=True, dest="session_id", help="Session ID")
+    trade_buy.add_argument(
+        "--date",
+        dest="trade_date",
+        default=datetime.now().date().isoformat(),
+        help="Trade date for execution price lookup (YYYY-MM-DD)",
+    )
+
+    trade_sell = trade_subparsers.add_parser("sell", help="Sell one ticker")
+    trade_sell.add_argument("ticker", help="Ticker")
+    trade_sell.add_argument("quantity", type=int, help="Quantity")
+    trade_sell.add_argument("--session", required=True, dest="session_id", help="Session ID")
+    trade_sell.add_argument(
+        "--date",
+        dest="trade_date",
+        default=datetime.now().date().isoformat(),
+        help="Trade date for execution price lookup (YYYY-MM-DD)",
+    )
+
+    trade_positions = trade_subparsers.add_parser("positions", help="Show current positions")
+    trade_positions.add_argument("--session", required=True, dest="session_id", help="Session ID")
+
+    trade_profit = trade_subparsers.add_parser("profit", help="Show profit summary")
+    trade_profit.add_argument("--session", required=True, dest="session_id", help="Session ID")
+
+    # event subcommands
+    event_parser = subparsers.add_parser("event", help="Event broadcasting commands")
+    event_subparsers = event_parser.add_subparsers(dest="event_command", help="Event actions")
+
+    event_trigger = event_subparsers.add_parser("trigger", help="Trigger one event")
+    event_trigger.add_argument("event_type", help="Event type, e.g. daily_review")
+    target_group = event_trigger.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("--all", action="store_true", dest="all_sessions", help="Trigger all listening sessions")
+    target_group.add_argument("--session", dest="session_id", help="Trigger a specific session")
+    event_trigger.add_argument("--payload", default=None, help="Optional JSON payload object")
 
     return parser.parse_args()
 
@@ -926,6 +1222,27 @@ def main():
 
     # Ensure workspace directory exists
     workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.command == "session":
+        if not args.session_command:
+            print(f"{Colors.RED}❌ Missing session action. Use: create/list/start/stop/delete{Colors.RESET}")
+            return
+        handle_session_command(args, workspace_dir)
+        return
+
+    if args.command == "trade":
+        if not args.trade_command:
+            print(f"{Colors.RED}❌ Missing trade action. Use: buy/sell/positions/profit{Colors.RESET}")
+            return
+        handle_trade_command(args, workspace_dir)
+        return
+
+    if args.command == "event":
+        if not args.event_command:
+            print(f"{Colors.RED}❌ Missing event action. Use: trigger{Colors.RESET}")
+            return
+        handle_event_command(args, workspace_dir)
+        return
 
     # Run the agent (config always loaded from package directory)
     asyncio.run(run_agent(workspace_dir, task=args.task))
