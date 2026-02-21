@@ -217,9 +217,83 @@ session.event_filter = ["daily_review"]  # 只接收复盘事件
 
 ---
 
-## 7. 模拟交易
+## 7. 数据同步工具
 
-### 6.1 规则
+### 7.1 SyncDataTool（新增）
+
+```python
+class SyncDataTool(Tool):
+    """数据同步工具"""
+    
+    name = "sync_data"
+    description = "同步股票 K 线数据到本地数据库"
+    
+    parameters = {
+        "type": "object",
+        "properties": {
+            "tickers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "股票代码列表，如 ['600519', '000858']。为空则同步全市场"
+            },
+            "start_date": {
+                "type": "string",
+                "description": "开始日期 YYYY-MM-DD，默认3年前"
+            },
+            "end_date": {
+                "type": "string",
+                "description": "结束日期 YYYY-MM-DD，默认昨天"
+            }
+        }
+    }
+    
+    async def execute(self, tickers: list = None, start_date: str = None, end_date: str = None) -> ToolResult:
+        """同步 K 线数据"""
+        if not tickers:
+            tickers = self.get_all_tickers()  # 获取全市场股票
+        
+        if not end_date:
+            end_date = (date.today() - timedelta(days=1)).isoformat()
+        if not start_date:
+            start_date = (date.today() - timedelta(days=365*3)).isoformat()
+        
+        synced = 0
+        for ticker in tickers:
+            try:
+                data = await self.fetch_kline(ticker, start_date, end_date)
+                self.db.insert_kline(data)
+                synced += 1
+            except Exception as e:
+                logging.warning(f"同步 {ticker} 失败: {e}")
+        
+        return ToolResult(
+            success=True,
+            content=f"同步完成，共同步 {synced} 只股票，数据范围 {start_date} ~ {end_date}"
+        )
+```
+
+### 7.2 CLI 同步命令
+
+```bash
+# 同步单只股票
+mini-agent sync 600519 --start 2020-01-01
+
+# 同步多只股票
+mini-agent sync 600519,000858,300750
+
+# 同步全市场（耗时较长）
+mini-agent sync --all
+
+# 定时同步（每日16:00）
+# 在 crontab 中配置
+0 16 * * 1-5 mini-agent sync --all
+```
+
+---
+
+## 8. 模拟交易
+
+### 8.1 规则（续前文）
 
 - 初始资金：10 万元（可配置）
 - 成交价格：次日开盘价
@@ -250,9 +324,9 @@ class SimulateTradeTool(Tool):
 
 ---
 
-## 8. 回测系统
+## 9. 回测系统
 
-### 7.1 回测流程
+### 9.1 回测流程
 
 ```
 1. 创建回测 session
@@ -307,7 +381,7 @@ class HistoricalEvent模拟:
 
 ---
 
-## 9. 提示词实验
+## 10. 提示词实验
 
 ### 8.1 对比实验
 
@@ -353,7 +427,7 @@ variables = {
 
 ---
 
-## 10. 数据存储
+## 11. 数据存储
 
 ### 10.1 K 线数据库（核心）
 
@@ -500,7 +574,7 @@ CREATE INDEX idx_mem_session ON memories(session_id, is_deleted);
 
 ---
 
-## 10. CLI 命令汇总
+## 12. CLI 命令汇总
 
 ```bash
 # Session 管理
@@ -533,7 +607,7 @@ mini-agent event trigger daily_review --session <id>
 
 ---
 
-## 11. 实施计划
+## 13. 实施计划
 
 ### Phase 1: Session 管理
 - [ ] Session 数据模型
