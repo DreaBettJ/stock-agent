@@ -355,7 +355,56 @@ variables = {
 
 ## 10. 数据存储
 
-### 9.1 Session 表
+### 10.1 K 线数据库（核心）
+
+```sql
+-- 日线数据
+CREATE TABLE daily_kline (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,           -- 股票代码，如 "600519"
+    date DATE NOT NULL,            -- 交易日期
+    open REAL,                     -- 开盘价
+    high REAL,                     -- 最高价
+    low REAL,                      -- 最低价
+    close REAL,                    -- 收盘价
+    volume REAL,                   -- 成交量
+    amount REAL,                   -- 成交额
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(ticker, date)
+);
+
+-- 索引
+CREATE INDEX idx_kline_ticker ON daily_kline(ticker);
+CREATE INDEX idx_kline_date ON daily_kline(date);
+CREATE INDEX idx_kline_ticker_date ON daily_kline(ticker, date);
+```
+
+**同步方式**：
+- 数据源：腾讯财经 API / AkShare
+- 同步时间：每日 16:00（收盘后）
+- 同步范围：近 2 年的增量数据
+
+**查询接口**：
+```python
+class KLineDB:
+    """K 线数据库"""
+    
+    def get_kline(self, ticker: str, start: str, end: str) -> pd.DataFrame:
+        """获取历史 K 线"""
+        sql = """
+            SELECT * FROM daily_kline 
+            WHERE ticker = ? AND date BETWEEN ? AND ?
+            ORDER BY date ASC
+        """
+    
+    def get_latest_price(self, ticker: str) -> float:
+        """获取最新收盘价"""
+    
+    def get_trading_days(self, start: str, end: str) -> list[str]:
+        """获取交易日列表"""
+```
+
+### 10.2 Session 表
 
 ```sql
 CREATE TABLE sessions (
