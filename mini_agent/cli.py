@@ -718,6 +718,11 @@ Examples:
     target_group.add_argument("--session", dest="session_id", help="Trigger a specific session")
     event_trigger.add_argument("--payload", default=None, help="Optional JSON payload object")
 
+    # health check command
+    health_parser = subparsers.add_parser("health", help="Health check commands")
+    health_subparsers = health_parser.add_subparsers(dest="health_command", help="Health actions")
+    health_check = health_subparsers.add_parser("check", help="Run health check")
+
     return parser.parse_args()
 
 
@@ -1271,6 +1276,24 @@ async def run_agent(workspace_dir: Path, task: str = None):
     await _quiet_cleanup()
 
 
+def handle_health_command(args: argparse.Namespace, workspace_dir: Path) -> None:
+    """Handle health check commands."""
+    from .observable import HealthCheck
+
+    if args.health_command == "check":
+        print(f"{Colors.CYAN}🔍 Running health check...{Colors.RESET}\n")
+        result = HealthCheck.check_all()
+
+        status = result["status"]
+        status_color = Colors.GREEN if status == "healthy" else Colors.RED if status == "unhealthy" else Colors.YELLOW
+
+        print(f"{status_color}Status: {status.upper()}{Colors.RESET}\n")
+
+        print(f"{Colors.BOLD}Checks:{Colors.RESET}")
+        for check_name, check_result in result["checks"].items():
+            print(f"  {check_name}: {check_result}")
+
+
 def main():
     """Main entry point for CLI"""
     setup_logging()
@@ -1324,6 +1347,13 @@ def main():
             print(f"{Colors.RED}❌ Missing event action. Use: trigger{Colors.RESET}")
             return
         handle_event_command(args, workspace_dir)
+        return
+
+    if args.command == "health":
+        if not args.health_command:
+            print(f"{Colors.RED}❌ Missing health action. Use: check{Colors.RESET}")
+            return
+        handle_health_command(args, workspace_dir)
         return
 
     # Run the agent (config always loaded from package directory)
