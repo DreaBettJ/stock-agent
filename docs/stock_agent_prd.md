@@ -382,7 +382,7 @@ CREATE INDEX idx_kline_ticker_date ON daily_kline(ticker, date);
 **同步方式**：
 - 数据源：腾讯财经 API / AkShare
 - 同步时间：每日 16:00（收盘后）
-- 同步范围：近 2 年的增量数据
+- 同步范围：永久保存（增量同步）
 
 **查询接口**：
 ```python
