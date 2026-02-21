@@ -217,62 +217,11 @@ session.event_filter = ["daily_review"]  # 只接收复盘事件
 
 ---
 
-## 7. 数据同步工具
+## 7. 数据同步（CLI 命令）
 
-### 7.1 SyncDataTool（新增）
+> 注：数据同步是独立的后台任务，不作为 Agent Tool
 
-```python
-class SyncDataTool(Tool):
-    """数据同步工具"""
-    
-    name = "sync_data"
-    description = "同步股票 K 线数据到本地数据库"
-    
-    parameters = {
-        "type": "object",
-        "properties": {
-            "tickers": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "股票代码列表，如 ['600519', '000858']。为空则同步全市场"
-            },
-            "start_date": {
-                "type": "string",
-                "description": "开始日期 YYYY-MM-DD，默认3年前"
-            },
-            "end_date": {
-                "type": "string",
-                "description": "结束日期 YYYY-MM-DD，默认昨天"
-            }
-        }
-    }
-    
-    async def execute(self, tickers: list = None, start_date: str = None, end_date: str = None) -> ToolResult:
-        """同步 K 线数据"""
-        if not tickers:
-            tickers = self.get_all_tickers()  # 获取全市场股票
-        
-        if not end_date:
-            end_date = (date.today() - timedelta(days=1)).isoformat()
-        if not start_date:
-            start_date = (date.today() - timedelta(days=365*3)).isoformat()
-        
-        synced = 0
-        for ticker in tickers:
-            try:
-                data = await self.fetch_kline(ticker, start_date, end_date)
-                self.db.insert_kline(data)
-                synced += 1
-            except Exception as e:
-                logging.warning(f"同步 {ticker} 失败: {e}")
-        
-        return ToolResult(
-            success=True,
-            content=f"同步完成，共同步 {synced} 只股票，数据范围 {start_date} ~ {end_date}"
-        )
-```
-
-### 7.2 CLI 同步命令
+### 7.1 CLI 同步命令
 
 ```bash
 # 同步单只股票
