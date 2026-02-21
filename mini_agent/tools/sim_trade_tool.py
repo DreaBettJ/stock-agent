@@ -179,11 +179,12 @@ class SimulateTradeTool(Tool):
                 return ToolResult(success=False, content="", error=f"session mode must be simulation, got {session.mode}")
 
             symbol = self.kline_db.normalize_ticker(ticker)
-            exec_price = self.kline_db.get_next_open_price(symbol, trade_date)
-            gross_amount = exec_price * quantity
             action_normalized = action.strip().lower()
-
+            
+            # Buy uses next open price, Sell uses close price (today)
             if action_normalized == "buy":
+                exec_price = self.kline_db.get_next_open_price(symbol, trade_date)
+                gross_amount = exec_price * quantity
                 fee = gross_amount * self.COMMISSION_RATE
                 cash_delta = -(gross_amount + fee)
                 if session.current_cash + cash_delta < -1e-9:
@@ -198,6 +199,9 @@ class SimulateTradeTool(Tool):
                 profit = None
 
             elif action_normalized == "sell":
+                # For sell, use today's close price
+                exec_price = self.kline_db.get_latest_price(symbol)
+                gross_amount = exec_price * quantity
                 old_position = self.store.get_position(session_id, symbol)
                 if old_position is None or int(old_position["quantity"]) < quantity:
                     return ToolResult(success=False, content="", error="insufficient position")

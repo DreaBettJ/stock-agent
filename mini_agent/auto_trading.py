@@ -138,7 +138,7 @@ class AutoTradingWorkflow:
         ]
 
     def _get_positions(self, session_id: str) -> list[dict]:
-        """Get current positions."""
+        """Get current positions with kline data."""
         import sqlite3
         
         db_path = self.session_manager.db_path
@@ -161,6 +161,16 @@ class AutoTradingWorkflow:
             profit = (current_price - r["avg_cost"]) * r["quantity"]
             profit_rate = (current_price - r["avg_cost"]) / r["avg_cost"] * 100
             
+            # Get kline data (last 20 days)
+            from datetime import datetime, timedelta
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            
+            try:
+                klines = self.kline_db.get_kline(r["ticker"], start_date, end_date)
+            except Exception:
+                klines = []
+            
             positions.append({
                 "ticker": r["ticker"],
                 "quantity": r["quantity"],
@@ -168,6 +178,7 @@ class AutoTradingWorkflow:
                 "current_price": current_price,
                 "profit": profit,
                 "profit_rate": profit_rate,
+                "klines": klines[-20:] if klines else [],  # Last 20 days
             })
         
         return positions
@@ -181,16 +192,27 @@ class AutoTradingWorkflow:
     ) -> str:
         """Build daily review prompt."""
         
-        # Format positions
+        # Format positions with kline data
         positions_text = "无持仓"
         if positions:
             lines = []
             for p in positions:
+                kline_info = ""
+                if p.get("klines") and len(p["klines"]) >= 5:
+                    # Get recent price trend
+                    recent = p["klines"][-5:]
+                    closes = [k["close"] for k in recent]
+                    trend = "上涨" if closes[-1] > closes[0] else "下跌"
+                    ma5 = sum(closes[-5:]) / 5
+                    ma10 = sum(closes[-10:]) / 10 if len(closes) >= 10 else ma5
+                    golden_cross = "金叉" if ma5 > ma10 else "死叉"
+                    kline_info = f", 5日均线{ma5:.2f}, 10日均线{ma10:.2f}, {golden_cross}"
+                
                 lines.append(
                     f"- {p['ticker']}: 数量{p['quantity']}, "
                     f"成本{p['avg_cost']:.2f}, "
                     f"现价{p['current_price']:.2f}, "
-                    f"盈亏{p['profit']:.2f}({p['profit_rate']:.1f}%)"
+                    f"盈亏{p['profit']:.2f}({p['profit_rate']:.1f}%){kline_info}"
                 )
             positions_text = "\n".join(lines)
         
@@ -215,8 +237,8 @@ class AutoTradingWorkflow:
 {session.system_prompt}
 
 请根据你的策略分析：
-1. 持仓是否需要卖出？
-2. 是否有符合策略的买入机会？
+1. 持仓是否需要卖出？（死叉、涨幅>15%、跌幅>7%止损）
+2. 是否有符合策略的买入机会？（金叉、回调企稳）
 3. 风险提示
 
 注意：如果不需要操作，请回复"不操作"。
