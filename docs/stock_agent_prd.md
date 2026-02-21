@@ -146,22 +146,95 @@
 
 | 等级 | 说明 | 存储 | 裁剪策略 |
 |------|------|------|----------|
-| **0 普通** | 一般对话内容 | memories表 | 超过80k token时优先删除 |
+| **0 普通** | 一般对话内容 | memories表 | 超过80k token时逻辑删除 |
 | **1 重要** | 买入/卖出操作 | trades表 | 永不删除 |
 | **2 主线** | 主线判断、市场分析 | memories表(importance=2) | 永不删除 |
 
-#### 3.3.2 记忆表结构
+#### 3.3.2 记忆存储机制
+
+**核心原则**：逻辑删除，裁剪后或重启只需加载未删除的记忆
 
 ```sql
--- 对话记忆表
+-- 对话记忆表（逻辑删除）
 CREATE TABLE memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
-    role TEXT NOT NULL,  -- user/assistant/system
-    content TEXT NOT NULL,
-    importance INT DEFAULT 0,  -- 0普通 1重要 2主线
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    role TEXT NOT NULL,          -- user/assistant/system
+    content TEXT NOT NULL,       -- 记忆内容
+    importance INT DEFAULT 0,    -- 0普通 1重要 2主线
+    is_deleted INT DEFAULT 0,    -- 0未删除 1已删除（逻辑删除）
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at DATETIME         -- 删除时间
 );
+
+-- 索引
+CREATE INDEX idx_memories_session ON memories(session_id, is_deleted);
+CREATE INDEX idx_memories_importance ON memories(session_id, importance, is_deleted);
+```
+
+**加载逻辑**：
+```python
+class MemoryManager:
+    """记忆管理器"""
+    
+    def load_session_memory(self, session_id: str) -> list[Message]:
+        """加载会话记忆（仅加载未删除的记忆）"""
+        sql = """
+            SELECT role, content 
+            FROM memories 
+            WHERE session_id = ? AND is_deleted = 0 
+            ORDER BY created_at ASC
+        """
+        return self.db.query(sql, [session_id])
+    
+    def save_memory(self, session_id: str, role: str, content: str, importance: int = 0):
+        """保存记忆"""
+        sql = """
+            INSERT INTO memories (session_id, role, content, importance)
+            VALUES (?, ?, ?, ?)
+        """
+        self.db.execute(sql, [session_id, role, content, importance])
+    
+    def soft_delete(self, memory_id: int):
+        """逻辑删除（裁剪时使用）"""
+        sql = "UPDATE memories SET is_deleted = 1, deleted_at = NOW() WHERE id = ?"
+        self.db.execute(sql, [memory_id])
+    
+    def prune_memory(self, session_id: str, keep_importance: int = 1):
+        """裁剪记忆：删除 importance < keep_importance 的普通记忆"""
+        sql = """
+            UPDATE memories 
+            SET is_deleted = 1, deleted_at = NOW() 
+            WHERE session_id = ? 
+            AND importance < ? 
+            AND is_deleted = 0
+        """
+        self.db.execute(sql, [session_id, keep_importance])
+```
+
+**启动加载流程**：
+```
+1. 接收 session_id 参数
+2. 查询 memories 表，条件：session_id = ? AND is_deleted = 0
+3. 按时间顺序加载到上下文
+4. 裁剪时：UPDATE is_deleted = 1
+5. 重启后：自动加载未删除的记忆
+```
+
+#### 3.3.3 裁剪机制
+
+**触发条件**：当前上下文超过 80,000 tokens
+
+**裁剪策略**：
+1. 统计当前 token 数
+2. 如果超过限制，按重要性从低到高逻辑删除
+3. 删除操作：`UPDATE memories SET is_deleted = 1 WHERE id = ?`
+4. 保留：importance >= 1 的记忆（买卖记录、主线判断）
+
+**保留规则**：
+- 买入/卖出记录 → 永不删除
+- 主线判断（importance=2）→ 永不删除
+- 普通对话（importance=0）→ 可删除
 
 -- 索引
 CREATE INDEX idx_memories_session ON memories(session_id);
