@@ -403,9 +403,16 @@ CREATE INDEX idx_kline_ticker_date ON daily_kline(ticker, date);
 ```
 
 **同步方式**：
-- 数据源：腾讯财经 API / AkShare
-- 同步时间：每日 16:00（收盘后）
-- 同步范围：永久保存（增量同步）
+- 数据源：本地 CSV 文件（后复权）
+- 同步时间：一次性导入
+- 同步范围：永久保存（1991-2026）
+
+**数据现状**：
+| 数据类型 | 状态 | 说明 |
+|----------|------|------|
+| 日线数据（历史） | ✅ 已同步 | 5,484 只股票，1600万+ 条 |
+| 当天实时行情 | ❌ 需补充 | 需要通过 AkShare 实时获取 |
+| 选股筛选 | ❌ 需补充 | 需要从历史数据中筛选 |
 
 **查询接口**：
 ```python
@@ -425,9 +432,33 @@ class KLineDB:
     
     def get_trading_days(self, start: str, end: str) -> list[str]:
         """获取交易日列表"""
+
+### 10.2 实时数据获取
+
+**数据来源**：AkShare（实时获取，不存储）
+
+| 数据 | 获取方式 | 说明 |
+|------|----------|------|
+| 当天行情 | AkShare 实时 API | 盘中实时价格 |
+| 选股筛选 | 本地数据库查询 | 从历史 K 线中筛选符合条件的股票 |
+
+```python
+class RealTimeData:
+    """实时数据获取"""
+    
+    async def get_realtime_quote(self, ticker: str) -> dict:
+        """获取实时行情"""
+        # 使用 AkShare 获取当天数据
+        return await akshare_call("stock_zh_a_spot_em")
+    
+    async def screen_stocks(self, conditions: dict) -> list:
+        """选股筛选"""
+        # 从本地数据库查询
+        sql = "SELECT * FROM daily_kline WHERE ..."
+        return db.query(sql)
 ```
 
-### 10.2 Session 表
+### 10.3 Session 表
 
 ```sql
 CREATE TABLE sessions (
