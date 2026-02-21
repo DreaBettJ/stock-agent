@@ -467,6 +467,69 @@ async def _default_event_trigger(session, event: dict) -> str:
     return f"TRIGGERED session={session.session_id} event={event.get('type')}"
 
 
+def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> None:
+    """Handle backtest subcommands."""
+    from .backtest import BacktestEngine, PerformanceAnalyzer
+    from .tools.kline_db_tool import KLineDB
+
+    db_path = get_memory_db_path(workspace_dir)
+    # Use stock_kline.db for K-line data
+    kline_db_path = workspace_dir / "stock_kline.db"
+    if not kline_db_path.exists():
+        print(f"{Colors.RED}❌ K-line database not found: {kline_db_path}{Colors.RESET}")
+        return
+    
+    session_manager = SessionManager(db_path=str(db_path))
+    kline_db = KLineDB(db_path=str(kline_db_path))
+    broadcaster = EventBroadcaster(session_manager=session_manager, trigger=_default_event_trigger)
+    engine = BacktestEngine(session_manager, kline_db, broadcaster)
+
+    if args.backtest_command == "run":
+        print(f"{Colors.CYAN}🔄 Running backtest...{Colors.RESET}")
+        print(f"session: {args.session}")
+        print(f"period: {args.start} ~ {args.end}")
+
+        result = asyncio.run(engine.run(args.session, args.start, args.end))
+
+        if "error" in result:
+            print(f"{Colors.RED}❌ {result['error']}{Colors.RESET}")
+            return
+
+        perf = result["performance"]
+        print(f"\n{Colors.GREEN}✅ Backtest completed!{Colors.RESET}")
+        print(f"\n{'='*40}")
+        print(f"{Colors.BOLD}Performance Summary{Colors.RESET}")
+        print(f"{'='*40}")
+        print(f"Period:        {result['start_date']} ~ {result['end_date']}")
+        print(f"Trading Days:  {result['trading_days']}")
+        print(f"Total Trades:  {perf.get('total_trades', 0)}")
+        print(f"{'-'*40}")
+        print(f"Initial:       ¥{perf.get('initial_capital', 0):,.2f}")
+        print(f"Final:         ¥{perf.get('final_value', 0):,.2f}")
+        print(f"Total Return:  {perf.get('total_return', 0)*100:.2f}%")
+        print(f"Annual Return: {perf.get('annual_return', 0)*100:.2f}%")
+        print(f"Max Drawdown: {perf.get('max_drawdown', 0)*100:.2f}%")
+        print(f"Win Rate:     {perf.get('win_rate', 0)*100:.1f}%")
+        print(f"Profit Factor:{perf.get('profit_factor', 0):.2f}")
+        print(f"{'='*40}")
+
+    elif args.backtest_command == "result":
+        # Show stored backtest result
+        print(f"{Colors.CYAN}Backtest result for session: {args.session}{Colors.RESET}")
+        # For now, just show session info
+        try:
+            session = session_manager.get_session(args.session)
+            print(f"Mode: {session.mode}")
+            print(f"Status: {session.status}")
+            print(f"Initial capital: ¥{session.initial_capital:,.2f}")
+            print(f"Current cash: ¥{session.current_cash:,.2f}")
+        except KeyError:
+            print(f"{Colors.RED}❌ Session not found: {args.session}{Colors.RESET}")
+
+
+
+
+
 def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle event subcommands."""
     if args.event_command != "trigger":
@@ -631,6 +694,18 @@ Examples:
 
     trade_profit = trade_subparsers.add_parser("profit", help="Show profit summary")
     trade_profit.add_argument("--session", required=True, dest="session_id", help="Session ID")
+
+    # backtest subcommands
+    backtest_parser = subparsers.add_parser("backtest", help="Backtest commands")
+    backtest_subparsers = backtest_parser.add_subparsers(dest="backtest_command", help="Backtest actions")
+
+    backtest_run = backtest_subparsers.add_parser("run", help="Run backtest")
+    backtest_run.add_argument("--session", required=True, help="Session ID for backtest")
+    backtest_run.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
+    backtest_run.add_argument("--end", required=True, help="End date YYYY-MM-DD")
+
+    backtest_result = backtest_subparsers.add_parser("result", help="Show backtest result")
+    backtest_result.add_argument("--session", required=True, help="Session ID")
 
     # event subcommands
     event_parser = subparsers.add_parser("event", help="Event broadcasting commands")
@@ -1235,6 +1310,13 @@ def main():
             print(f"{Colors.RED}❌ Missing trade action. Use: buy/sell/positions/profit{Colors.RESET}")
             return
         handle_trade_command(args, workspace_dir)
+        return
+
+    if args.command == "backtest":
+        if not args.backtest_command:
+            print(f"{Colors.RED}❌ Missing backtest action. Use: run/result{Colors.RESET}")
+            return
+        handle_backtest_command(args, workspace_dir)
         return
 
     if args.command == "event":
