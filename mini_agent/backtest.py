@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -137,7 +138,7 @@ class BacktestEngine:
 
     async def run(
         self,
-        session_id: str,
+        session_id: int | str,
         start_date: str,
         end_date: str,
     ) -> dict[str, Any]:
@@ -152,27 +153,34 @@ class BacktestEngine:
         # Initialize
         equity_curve = []
         all_trades = []
-        
+
+        # Clear previous simulation state for deterministic reruns
+        self._reset_session_state(session.session_id)
+
         # Reset session cash
         initial_cash = session.initial_capital
-        self.session_manager.update_current_cash(session_id, initial_cash)
+        self.session_manager.update_current_cash(session.session_id, initial_cash)
 
         # Mark as running
-        self.session_manager.start_session(session_id)
+        self.session_manager.start_session(session.session_id)
 
         # Iterate through trading days
         for trading_day in trading_days:
-            self.session_manager.update_current_date(session_id, trading_day)
+            self.session_manager.update_current_date(session.session_id, trading_day)
             
             # Generate event
             event = self.historical_generator.generate_daily_review_event(trading_day)
             
-            # Broadcast to session
-            results = await self.event_broadcaster.broadcast(event)
+            # Trigger ONLY current session to avoid cross-session contamination.
+            trigger_session = getattr(self.event_broadcaster, "trigger_session", None)
+            if trigger_session is not None and inspect.iscoroutinefunction(trigger_session):
+                await trigger_session(session, event)
+            else:
+                await self.event_broadcaster.broadcast(event)
             
             # Record equity
-            current_cash = self.session_manager.get_session(session_id).current_cash
-            position_value = self._calculate_position_value(session_id)
+            current_cash = self.session_manager.get_session(session.session_id).current_cash
+            position_value = self._calculate_position_value(session.session_id, trading_day)
             total_value = current_cash + position_value
             
             equity_curve.append({
@@ -183,16 +191,16 @@ class BacktestEngine:
             })
 
         # Mark as finished
-        self.session_manager.finish_session(session_id)
+        self.session_manager.finish_session(session.session_id)
 
         # Get all trades
-        all_trades = self._get_session_trades(session_id)
+        all_trades = self._get_session_trades(session.session_id)
 
         # Calculate performance
         performance = PerformanceAnalyzer.calculate(all_trades, equity_curve)
 
         return {
-            "session_id": session_id,
+            "session_id": session.session_id,
             "start_date": start_date,
             "end_date": end_date,
             "trading_days": len(trading_days),
@@ -201,34 +209,87 @@ class BacktestEngine:
             "trades": all_trades,
         }
 
-    def _calculate_position_value(self, session_id: str) -> float:
+    def _calculate_position_value(self, session_id: int | str, pricing_date: str | None = None) -> float:
         """Calculate current position value."""
         with sqlite3.connect(self.session_manager.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                SELECT ticker, quantity, avg_cost
-                FROM sim_positions
-                WHERE session_id = ?
-            """, (session_id,)).fetchall()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT ticker, quantity, avg_cost
+                    FROM sim_positions
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return 0.0
 
         total_value = 0.0
         for row in rows:
             try:
-                current_price = self.kline_db.get_latest_price(row["ticker"])
+                if pricing_date:
+                    current_price = self.kline_db.get_price_on_or_before(row["ticker"], pricing_date)
+                else:
+                    current_price = self.kline_db.get_latest_price(row["ticker"])
                 total_value += current_price * row["quantity"]
             except Exception:
                 pass
 
         return total_value
 
-    def _get_session_trades(self, session_id: str) -> list[dict]:
+    def _get_session_trades(self, session_id: int | str) -> list[dict]:
         """Get all trades for a session."""
         with sqlite3.connect(self.session_manager.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                SELECT * FROM sim_trades
-                WHERE session_id = ?
-                ORDER BY trade_date
-            """, (session_id,)).fetchall()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM sim_trades
+                    WHERE session_id = ?
+                    ORDER BY trade_date
+                    """,
+                    (session_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
 
         return [dict(r) for r in rows]
+
+    def _reset_session_state(self, session_id: int) -> None:
+        """Clear one session's simulation positions/trades before a new backtest run."""
+        with sqlite3.connect(self.session_manager.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sim_positions (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    quantity INT,
+                    avg_cost REAL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT,
+                    UNIQUE(session_id, ticker)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sim_trades (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    price REAL,
+                    quantity INT,
+                    amount REAL,
+                    fee REAL,
+                    profit REAL,
+                    trade_date TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute("DELETE FROM sim_positions WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sim_trades WHERE session_id = ?", (session_id,))
+            conn.commit()

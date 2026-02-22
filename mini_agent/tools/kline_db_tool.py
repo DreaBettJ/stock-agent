@@ -105,6 +105,23 @@ class KLineDB:
             raise KeyError(f"kline not found for ticker: {symbol}")
         return float(row["close"])
 
+    def get_price_on_or_before(self, ticker: str, as_of_date: str) -> float:
+        """Get latest close price on or before the specified date."""
+        symbol = self.normalize_ticker(ticker)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT close FROM daily_kline
+                WHERE ticker = ? AND date <= ?
+                ORDER BY date DESC
+                LIMIT 1
+                """,
+                (symbol, as_of_date),
+            ).fetchone()
+        if row is None or row["close"] is None:
+            raise KeyError(f"kline not found for ticker: {symbol} as_of_date={as_of_date}")
+        return float(row["close"])
+
     def get_next_open_price(self, ticker: str, as_of_date: str) -> float:
         """Get next trading day's open price, fallback to same-day close."""
         symbol = self.normalize_ticker(ticker)

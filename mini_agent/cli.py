@@ -36,7 +36,7 @@ from mini_agent import LLMClient
 from mini_agent.agent import Agent
 from mini_agent.config import Config
 from mini_agent.event_broadcaster import EventBroadcaster
-from mini_agent.paths import get_default_memory_db_path
+from mini_agent.paths import get_default_memory_db_path, resolve_kline_db_path
 from mini_agent.schema import LLMProvider
 from mini_agent.session import SessionManager
 from mini_agent.tools.base import Tool
@@ -317,7 +317,7 @@ def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> Non
     if args.session_command == "create":
         session_id = manager.create_session(
             name=args.name,
-            system_prompt=args.prompt,
+            system_prompt=args.prompt or "You are a helpful trading assistant.",
             mode=args.mode,
             initial_capital=args.initial_capital,
             event_filter=args.event_filter or [],
@@ -336,9 +336,8 @@ def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> Non
             return
         print("session_id\tname\tmode\tstatus\tlistening")
         for session in sessions:
-            short_id = session.session_id[:8]
             listening = "yes" if session.is_listening else "no"
-            print(f"{short_id}\t{session.name}\t{session.mode}\t{session.status}\t{listening}")
+            print(f"{session.session_id}\t{session.name}\t{session.mode}\t{session.status}\t{listening}")
         return
 
     try:
@@ -389,7 +388,7 @@ def _read_realized_profit(db_path: Path, session_id: str) -> float:
 def handle_trade_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle trade subcommands."""
     db_path = get_memory_db_path(workspace_dir)
-    kline_db_path = workspace_dir / "stock_kline.db"
+    kline_db_path = resolve_kline_db_path(workspace_dir)
     trade_tool = SimulateTradeTool(
         db_path=str(db_path),
         kline_db_path=str(kline_db_path) if kline_db_path.exists() else None,
@@ -431,7 +430,7 @@ def handle_trade_command(args: argparse.Namespace, workspace_dir: Path) -> None:
         return
 
     if args.trade_command == "profit":
-        kline_db = KLineDB(db_path=str(db_path))
+        kline_db = KLineDB(db_path=str(kline_db_path))
         realized = _read_realized_profit(db_path=db_path, session_id=args.session_id)
         unrealized = 0.0
         market_value = 0.0
@@ -479,8 +478,8 @@ def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> No
     from .tools.kline_db_tool import KLineDB
 
     db_path = get_memory_db_path(workspace_dir)
-    # Use stock_kline.db for K-line data
-    kline_db_path = workspace_dir / "stock_kline.db"
+    # Resolve stock_kline.db with workspace fallback
+    kline_db_path = resolve_kline_db_path(workspace_dir)
     if not kline_db_path.exists():
         print(f"{Colors.RED}❌ K-line database not found: {kline_db_path}{Colors.RESET}")
         return
@@ -561,10 +560,10 @@ def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
                 api_key = cfg.get("api_key")
         
         db_path = get_memory_db_path(workspace_dir)
-        kline_db_path = workspace_dir / "stock_kline.db"
+        kline_db_path = resolve_kline_db_path(workspace_dir)
         
         if not kline_db_path.exists():
-            print(f"{Colors.RED}❌ K-line database not found{Colors.RESET}")
+            print(f"{Colors.RED}❌ K-line database not found: {kline_db_path}{Colors.RESET}")
             return
         
         session_manager = SessionManager(db_path=str(db_path))
@@ -716,7 +715,7 @@ Examples:
 
     session_create = session_subparsers.add_parser("create", help="Create a session")
     session_create.add_argument("--name", required=True, help="Session name")
-    session_create.add_argument("--prompt", required=True, help="System prompt")
+    session_create.add_argument("--prompt", default="", help="System prompt (optional)")
     session_create.add_argument(
         "--mode",
         default="simulation",
@@ -725,6 +724,8 @@ Examples:
     )
     session_create.add_argument(
         "--initial-capital",
+        "--capital",
+        dest="initial_capital",
         type=float,
         default=100000.0,
         help="Initial capital",
@@ -739,13 +740,13 @@ Examples:
     session_subparsers.add_parser("list", help="List sessions")
 
     session_start = session_subparsers.add_parser("start", help="Start one session")
-    session_start.add_argument("session_id", help="Session ID")
+    session_start.add_argument("session_id", type=int, help="Session ID")
 
     session_stop = session_subparsers.add_parser("stop", help="Stop one session")
-    session_stop.add_argument("session_id", help="Session ID")
+    session_stop.add_argument("session_id", type=int, help="Session ID")
 
     session_delete = session_subparsers.add_parser("delete", help="Delete one session")
-    session_delete.add_argument("session_id", help="Session ID")
+    session_delete.add_argument("session_id", type=int, help="Session ID")
 
     # trade subcommands
     trade_parser = subparsers.add_parser("trade", help="Simulation trade commands")
@@ -754,7 +755,7 @@ Examples:
     trade_buy = trade_subparsers.add_parser("buy", help="Buy one ticker")
     trade_buy.add_argument("ticker", help="Ticker")
     trade_buy.add_argument("quantity", type=int, help="Quantity")
-    trade_buy.add_argument("--session", required=True, dest="session_id", help="Session ID")
+    trade_buy.add_argument("--session", required=True, dest="session_id", type=int, help="Session ID")
     trade_buy.add_argument(
         "--date",
         dest="trade_date",
@@ -765,7 +766,7 @@ Examples:
     trade_sell = trade_subparsers.add_parser("sell", help="Sell one ticker")
     trade_sell.add_argument("ticker", help="Ticker")
     trade_sell.add_argument("quantity", type=int, help="Quantity")
-    trade_sell.add_argument("--session", required=True, dest="session_id", help="Session ID")
+    trade_sell.add_argument("--session", required=True, dest="session_id", type=int, help="Session ID")
     trade_sell.add_argument(
         "--date",
         dest="trade_date",
@@ -774,22 +775,22 @@ Examples:
     )
 
     trade_positions = trade_subparsers.add_parser("positions", help="Show current positions")
-    trade_positions.add_argument("--session", required=True, dest="session_id", help="Session ID")
+    trade_positions.add_argument("--session", required=True, dest="session_id", type=int, help="Session ID")
 
     trade_profit = trade_subparsers.add_parser("profit", help="Show profit summary")
-    trade_profit.add_argument("--session", required=True, dest="session_id", help="Session ID")
+    trade_profit.add_argument("--session", required=True, dest="session_id", type=int, help="Session ID")
 
     # backtest subcommands
     backtest_parser = subparsers.add_parser("backtest", help="Backtest commands")
     backtest_subparsers = backtest_parser.add_subparsers(dest="backtest_command", help="Backtest actions")
 
     backtest_run = backtest_subparsers.add_parser("run", help="Run backtest")
-    backtest_run.add_argument("--session", required=True, help="Session ID for backtest")
+    backtest_run.add_argument("--session", required=True, type=int, help="Session ID for backtest")
     backtest_run.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
     backtest_run.add_argument("--end", required=True, help="End date YYYY-MM-DD")
 
     backtest_result = backtest_subparsers.add_parser("result", help="Show backtest result")
-    backtest_result.add_argument("--session", required=True, help="Session ID")
+    backtest_result.add_argument("--session", required=True, type=int, help="Session ID")
 
     # event subcommands
     event_parser = subparsers.add_parser("event", help="Event broadcasting commands")
@@ -800,7 +801,7 @@ Examples:
     event_trigger.add_argument("--auto", action="store_true", help="Auto trading: trigger agent analysis + execute trade")
     target_group = event_trigger.add_mutually_exclusive_group(required=True)
     target_group.add_argument("--all", action="store_true", dest="all_sessions", help="Trigger all listening sessions")
-    target_group.add_argument("--session", dest="session_id", help="Trigger a specific session")
+    target_group.add_argument("--session", dest="session_id", type=int, help="Trigger a specific session")
     event_trigger.add_argument("--payload", default=None, help="Optional JSON payload object")
 
     # health check command

@@ -137,18 +137,24 @@ class AutoTradingWorkflow:
             for r in rows if r["change_pct"] is not None
         ]
 
-    def _get_positions(self, session_id: str) -> list[dict]:
+    def _get_positions(self, session_id: int | str) -> list[dict]:
         """Get current positions with kline data."""
         import sqlite3
         
         db_path = self.session_manager.db_path
         with sqlite3.connect(db_path) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                SELECT ticker, quantity, avg_cost
-                FROM sim_positions
-                WHERE session_id = ?
-            """, (session_id,)).fetchall()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT ticker, quantity, avg_cost
+                    FROM sim_positions
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
 
         positions = []
         for r in rows:

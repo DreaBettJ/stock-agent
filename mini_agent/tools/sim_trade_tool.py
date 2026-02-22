@@ -64,14 +64,14 @@ class _SimTradeStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_positions_session ON sim_positions(session_id)")
             conn.commit()
 
-    def get_position(self, session_id: str, ticker: str) -> sqlite3.Row | None:
+    def get_position(self, session_id: int | str, ticker: str) -> sqlite3.Row | None:
         with self._connect() as conn:
             return conn.execute(
                 "SELECT session_id, ticker, quantity, avg_cost FROM sim_positions WHERE session_id = ? AND ticker = ?",
                 (session_id, ticker),
             ).fetchone()
 
-    def upsert_position(self, session_id: str, ticker: str, quantity: int, avg_cost: float) -> None:
+    def upsert_position(self, session_id: int | str, ticker: str, quantity: int, avg_cost: float) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
@@ -86,14 +86,14 @@ class _SimTradeStore:
             )
             conn.commit()
 
-    def delete_position(self, session_id: str, ticker: str) -> None:
+    def delete_position(self, session_id: int | str, ticker: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM sim_positions WHERE session_id = ? AND ticker = ?", (session_id, ticker))
             conn.commit()
 
     def insert_trade(
         self,
-        session_id: str,
+        session_id: int | str,
         ticker: str,
         action: str,
         price: float,
@@ -128,18 +128,11 @@ class SimulateTradeTool(Tool):
     ):
         self.db_path = db_path
         self.session_manager = SessionManager(db_path=db_path)
-        # K-line data is in separate database
+        # K-line data uses the same SQLite DB by default.
         if kline_db_path:
             self.kline_db = KLineDB(db_path=kline_db_path)
         else:
-            # Try to find kline DB in common locations
-            import os
-            workspace = os.path.dirname(os.path.abspath(db_path))
-            default_kline = os.path.join(workspace, "stock_kline.db")
-            if os.path.exists(default_kline):
-                self.kline_db = KLineDB(db_path=default_kline)
-            else:
-                self.kline_db = KLineDB(db_path=db_path)
+            self.kline_db = KLineDB(db_path=db_path)
         self.store = _SimTradeStore(db_path=db_path)
 
     @property
@@ -170,7 +163,7 @@ class SimulateTradeTool(Tool):
             "required": ["session_id", "action", "ticker", "quantity", "trade_date"],
         }
 
-    async def execute(self, session_id: str, action: str, ticker: str, quantity: int, trade_date: str) -> ToolResult:
+    async def execute(self, session_id: int | str, action: str, ticker: str, quantity: int, trade_date: str) -> ToolResult:
         try:
             if quantity <= 0:
                 return ToolResult(success=False, content="", error="quantity must be > 0")

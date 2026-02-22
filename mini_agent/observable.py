@@ -128,9 +128,11 @@ class HealthCheck:
             results["checks"]["database"] = f"error: {e}"
             results["status"] = "unhealthy"
 
-        # Check K-line database
+        # Check K-line data table (same DB as memory/session)
         try:
-            kline_path = Path("./workspace/stock_kline.db")
+            from .paths import get_default_memory_db_path
+
+            kline_path = get_default_memory_db_path()
             if kline_path.exists():
                 conn = sqlite3.connect(kline_path)
                 cursor = conn.execute("SELECT COUNT(*) FROM daily_kline")
