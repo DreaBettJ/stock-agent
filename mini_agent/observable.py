@@ -113,9 +113,9 @@ class HealthCheck:
         # Check database
         try:
             import sqlite3
-            from pathlib import Path
+            from .paths import get_default_memory_db_path
             
-            db_path = Path("./workspace/.agent_memory.db")
+            db_path = get_default_memory_db_path()
             if db_path.exists():
                 conn = sqlite3.connect(db_path)
                 conn.execute("SELECT 1")

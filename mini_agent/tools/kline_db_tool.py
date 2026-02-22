@@ -7,13 +7,15 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from mini_agent.paths import DEFAULT_MEMORY_DB_PATH
+
 from .base import Tool, ToolResult
 
 
 class KLineDB:
     """SQLite K-line database accessor."""
 
-    def __init__(self, db_path: str = "./workspace/.agent_memory.db"):
+    def __init__(self, db_path: str = str(DEFAULT_MEMORY_DB_PATH)):
         self.db_path = Path(db_path)
         self._init_db()
 
@@ -145,7 +147,7 @@ class KLineDB:
 class KLineQueryTool(Tool):
     """Tool to query historical daily K-line rows."""
 
-    def __init__(self, db_path: str = "./workspace/.agent_memory.db"):
+    def __init__(self, db_path: str = str(DEFAULT_MEMORY_DB_PATH)):
         self.kline_db = KLineDB(db_path=db_path)
 
     @property
@@ -178,6 +180,6 @@ class KLineQueryTool(Tool):
             return ToolResult(success=False, content="", error=f"Failed to query kline: {exc}")
 
 
-def create_kline_tools(db_path: str = "./workspace/.agent_memory.db") -> list[Tool]:
+def create_kline_tools(db_path: str = str(DEFAULT_MEMORY_DB_PATH)) -> list[Tool]:
     """Create K-line related tools."""
     return [KLineQueryTool(db_path=db_path)]

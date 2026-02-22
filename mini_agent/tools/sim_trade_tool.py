@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from mini_agent.paths import DEFAULT_MEMORY_DB_PATH
 from mini_agent.session import SessionManager
 
 from .base import Tool, ToolResult
@@ -16,7 +17,7 @@ from .kline_db_tool import KLineDB
 class _SimTradeStore:
     """SQLite storage for simulation trades and positions."""
 
-    def __init__(self, db_path: str = "./workspace/.agent_memory.db"):
+    def __init__(self, db_path: str = str(DEFAULT_MEMORY_DB_PATH)):
         self.db_path = Path(db_path)
         self._init_db()
 
@@ -122,7 +123,7 @@ class SimulateTradeTool(Tool):
 
     def __init__(
         self,
-        db_path: str = "./workspace/.agent_memory.db",
+        db_path: str = str(DEFAULT_MEMORY_DB_PATH),
         kline_db_path: str = None,
     ):
         self.db_path = db_path
@@ -245,6 +246,6 @@ class SimulateTradeTool(Tool):
             return ToolResult(success=False, content="", error=f"simulate trade failed: {exc}")
 
 
-def create_simulation_trade_tools(db_path: str = "./workspace/.agent_memory.db") -> list[Tool]:
+def create_simulation_trade_tools(db_path: str = str(DEFAULT_MEMORY_DB_PATH)) -> list[Tool]:
     """Create simulation trade tools."""
     return [SimulateTradeTool(db_path=db_path)]

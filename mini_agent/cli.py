@@ -36,6 +36,7 @@ from mini_agent import LLMClient
 from mini_agent.agent import Agent
 from mini_agent.config import Config
 from mini_agent.event_broadcaster import EventBroadcaster
+from mini_agent.paths import get_default_memory_db_path
 from mini_agent.schema import LLMProvider
 from mini_agent.session import SessionManager
 from mini_agent.tools.base import Tool
@@ -88,7 +89,7 @@ class Colors:
 
 def get_log_directory() -> Path:
     """Get the log directory path."""
-    return Path.home() / ".mini-agent" / "log"
+    return Path(__file__).resolve().parent.parent / "log"
 
 
 def setup_logging() -> None:
@@ -304,8 +305,9 @@ def print_stats(agent: Agent, session_start: datetime):
 
 
 def get_memory_db_path(workspace_dir: Path) -> Path:
-    """Get SQLite db path under workspace."""
-    return workspace_dir / ".agent_memory.db"
+    """Get unified SQLite db path."""
+    _ = workspace_dir
+    return get_default_memory_db_path()
 
 
 def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> None:
@@ -946,7 +948,7 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, 
 
     # Session note tool - needs workspace to store memory file
     if config.tools.enable_note:
-        memory_db = str(workspace_dir / ".agent_memory.db")
+        memory_db = str(get_memory_db_path(workspace_dir))
         tools.append(SessionNoteTool(memory_file=memory_db, session_id=session_id))
         tools.append(RecallNoteTool(memory_file=memory_db, session_id=session_id))
         print(f"{Colors.GREEN}✅ Loaded session note tools (SQLite, session_id: {session_id}){Colors.RESET}")
@@ -961,7 +963,7 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, 
     # Check if enable_trade_tools exists (added in config.yaml) or default to True
     enable_trade = getattr(config.tools, "enable_trade_tools", True)
     if enable_trade:
-        memory_db = str(workspace_dir / ".agent_memory.db")
+        memory_db = str(get_memory_db_path(workspace_dir))
         trade_tools = create_trade_tools(memory_file=memory_db, session_id=session_id)
         tools.extend(trade_tools)
         print(f"{Colors.GREEN}✅ Loaded {len(trade_tools)} trade tools (SQLite){Colors.RESET}")

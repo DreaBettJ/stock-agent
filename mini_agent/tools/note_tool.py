@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from mini_agent.paths import DEFAULT_MEMORY_DB_PATH
+
 from .base import Tool, ToolResult
 
 
@@ -82,7 +84,7 @@ class _NoteStore:
 class SessionNoteTool(Tool):
     """Tool for recording session notes into SQLite."""
 
-    def __init__(self, memory_file: str = "./workspace/.agent_memory.db", session_id: str | None = None):
+    def __init__(self, memory_file: str = str(DEFAULT_MEMORY_DB_PATH), session_id: str | None = None):
         self.memory_file = Path(memory_file)
         self.session_id = session_id or uuid4().hex
         self.store = _NoteStore(self.memory_file)
@@ -136,7 +138,7 @@ class SessionNoteTool(Tool):
 class RecallNoteTool(Tool):
     """Tool for recalling notes from SQLite."""
 
-    def __init__(self, memory_file: str = "./workspace/.agent_memory.db", session_id: str | None = None):
+    def __init__(self, memory_file: str = str(DEFAULT_MEMORY_DB_PATH), session_id: str | None = None):
         self.memory_file = Path(memory_file)
         self.session_id = session_id
         self.store = _NoteStore(self.memory_file)

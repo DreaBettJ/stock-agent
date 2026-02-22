@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from mini_agent.paths import DEFAULT_MEMORY_DB_PATH
+
 from .base import Tool, ToolResult
 
 
@@ -132,7 +134,7 @@ class _TradeStore:
 class TradeRecordTool(Tool):
     """Tool for recording buy/sell trades into SQLite."""
 
-    def __init__(self, memory_file: str = "./workspace/.agent_memory.db", session_id: str | None = None):
+    def __init__(self, memory_file: str = str(DEFAULT_MEMORY_DB_PATH), session_id: str | None = None):
         self.memory_file = Path(memory_file)
         self.session_id = session_id or uuid4().hex
         self.store = _TradeStore(self.memory_file)
@@ -248,7 +250,7 @@ class TradeRecordTool(Tool):
 class TradeHistoryTool(Tool):
     """Tool for querying trade history from SQLite."""
 
-    def __init__(self, memory_file: str = "./workspace/.agent_memory.db", session_id: str | None = None):
+    def __init__(self, memory_file: str = str(DEFAULT_MEMORY_DB_PATH), session_id: str | None = None):
         self.memory_file = Path(memory_file)
         self.session_id = session_id
         self.store = _TradeStore(self.memory_file)
@@ -334,7 +336,7 @@ class TradeHistoryTool(Tool):
 class PositionTool(Tool):
     """Tool for getting current positions (holdings) from trade history."""
 
-    def __init__(self, memory_file: str = "./workspace/.agent_memory.db", session_id: str | None = None):
+    def __init__(self, memory_file: str = str(DEFAULT_MEMORY_DB_PATH), session_id: str | None = None):
         self.memory_file = Path(memory_file)
         self.session_id = session_id
         self.store = _TradeStore(self.memory_file)
@@ -386,7 +388,7 @@ class PositionTool(Tool):
             return ToolResult(success=False, content="", error=f"Failed to get positions: {str(e)}")
 
 
-def create_trade_tools(memory_file: str = "./workspace/.agent_memory.db", session_id: str | None = None) -> list[Tool]:
+def create_trade_tools(memory_file: str = str(DEFAULT_MEMORY_DB_PATH), session_id: str | None = None) -> list[Tool]:
     """Create all trade-related tools.
     
     Args:

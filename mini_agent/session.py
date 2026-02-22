@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from .paths import DEFAULT_MEMORY_DB_PATH
+
 SessionMode = Literal["simulation", "backtest"]
 SessionStatus = Literal["running", "stopped", "finished"]
 
@@ -38,7 +40,7 @@ class ExperimentSession:
 class SessionManager:
     """SQLite-backed session manager."""
 
-    def __init__(self, db_path: str = "./workspace/.agent_memory.db"):
+    def __init__(self, db_path: str = str(DEFAULT_MEMORY_DB_PATH)):
         self.db_path = Path(db_path)
         self._init_db()
 
