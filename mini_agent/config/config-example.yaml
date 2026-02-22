@@ -55,6 +55,7 @@ tools:
   enable_mcp: true         # Enable MCP tools
   mcp_config_path: "mcp.json"  # MCP configuration file (same config directory)
                            # Note: API Keys for MCP tools are configured in mcp.json
+                           # Default template includes MiniMax Coding Plan MCP (web_search capability)
   # MCP timeout configuration (prevents hanging on network issues)
   mcp:
     connect_timeout: 10.0    # Connection timeout in seconds (default: 10)
