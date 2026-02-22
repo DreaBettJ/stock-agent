@@ -143,6 +143,7 @@ class BacktestEngine:
         end_date: str,
     ) -> dict[str, Any]:
         """Run backtest for a session."""
+        # 1) 校验 session 与交易日历。
         session = self.session_manager.get_session(session_id)
         
         # Get trading days in range
@@ -150,21 +151,21 @@ class BacktestEngine:
         if not trading_days:
             return {"error": f"No trading days in range {start_date} to {end_date}"}
 
-        # Initialize
+        # 2) 初始化内存中的结果容器。
         equity_curve = []
         all_trades = []
 
-        # Clear previous simulation state for deterministic reruns
+        # 3) 保证重复回测可复现：清理该 session 旧的模拟仓位与成交。
         self._reset_session_state(session.session_id)
 
-        # Reset session cash
+        # 4) 重置 session 运行态。
         initial_cash = session.initial_capital
         self.session_manager.update_current_cash(session.session_id, initial_cash)
 
-        # Mark as running
+        # 标记为运行中并开启监听，便于事件驱动回调。
         self.session_manager.start_session(session.session_id)
 
-        # Iterate through trading days
+        # 5) 按交易日逐日回放。
         for trading_day in trading_days:
             self.session_manager.update_current_date(session.session_id, trading_day)
             
@@ -176,9 +177,10 @@ class BacktestEngine:
             if trigger_session is not None and inspect.iscoroutinefunction(trigger_session):
                 await trigger_session(session, event)
             else:
+                # 兼容兜底：自定义 broadcaster 没有 trigger_session 时走原广播接口。
                 await self.event_broadcaster.broadcast(event)
             
-            # Record equity
+            # 记录当日权益：按当日可见价格估值（避免前视偏差）。
             current_cash = self.session_manager.get_session(session.session_id).current_cash
             position_value = self._calculate_position_value(session.session_id, trading_day)
             total_value = current_cash + position_value
@@ -190,7 +192,7 @@ class BacktestEngine:
                 "value": total_value,
             })
 
-        # Mark as finished
+        # 6) 结束 session 并汇总结果。
         self.session_manager.finish_session(session.session_id)
 
         # Get all trades
@@ -223,17 +225,21 @@ class BacktestEngine:
                     (session_id,),
                 ).fetchall()
             except sqlite3.OperationalError:
+                # 新库在首次交易前可能尚未创建模拟交易表。
                 return 0.0
 
         total_value = 0.0
         for row in rows:
             try:
                 if pricing_date:
+                    # 回测路径：使用“截至当日”的最新收盘价估值持仓。
                     current_price = self.kline_db.get_price_on_or_before(row["ticker"], pricing_date)
                 else:
+                    # 运行态汇总路径：使用最新可用收盘价。
                     current_price = self.kline_db.get_latest_price(row["ticker"])
                 total_value += current_price * row["quantity"]
             except Exception:
+                # 单个标的估值失败时忽略，继续计算其他仓位。
                 pass
 
         return total_value
@@ -252,6 +258,7 @@ class BacktestEngine:
                     (session_id,),
                 ).fetchall()
             except sqlite3.OperationalError:
+                # 新库在首次交易前可能尚未创建模拟交易表。
                 return []
 
         return [dict(r) for r in rows]
@@ -259,6 +266,7 @@ class BacktestEngine:
     def _reset_session_state(self, session_id: int) -> None:
         """Clear one session's simulation positions/trades before a new backtest run."""
         with sqlite3.connect(self.session_manager.db_path) as conn:
+            # 防御式建表，保证全新数据库首次回测也能直接运行。
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sim_positions (
