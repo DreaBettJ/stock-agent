@@ -502,6 +502,52 @@ async def _default_event_trigger(session, event: dict) -> str:
     return f"TRIGGERED session={session.session_id} event={event.get('type')}"
 
 
+def _build_event_from_args(args: argparse.Namespace) -> dict:
+    """Build normalized event payload from CLI args."""
+    event = {"type": args.event_type, "triggered_at": datetime.now().isoformat()}
+    if not args.payload:
+        return event
+
+    try:
+        payload = json.loads(args.payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON payload: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("--payload must be a JSON object")
+
+    event.update(payload)
+    return event
+
+
+def _match_single_session_for_event(session, event_type: str | None) -> tuple[bool, str | None]:
+    """Check whether one session should receive an event."""
+    if not session.is_listening:
+        return False, "session is not listening; run `mini-agent session start <id>` first"
+
+    if event_type and session.event_filter and event_type not in session.event_filter:
+        return False, f"session event_filter does not include '{event_type}'"
+
+    return True, None
+
+
+async def _run_auto_event_for_sessions(runtime, session_ids: list[int], trading_date: str) -> list[dict]:
+    """Run auto decision for multiple sessions concurrently."""
+    tasks = [
+        asyncio.create_task(run_llm_decision(runtime=runtime, session_id=session_id, trading_date=trading_date))
+        for session_id in session_ids
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    records: list[dict] = []
+    for session_id, result in zip(session_ids, results):
+        if isinstance(result, Exception):
+            records.append({"session_id": session_id, "success": False, "error": str(result)})
+            continue
+        records.append({"session_id": session_id, "success": True, "result": result})
+    return records
+
+
 def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle backtest subcommands."""
     from .backtest import BacktestEngine, PerformanceAnalyzer
@@ -592,87 +638,77 @@ def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     if args.event_command != "trigger":
         return
 
-    # Auto trading mode
-    if args.auto:
-        if not args.session_id:
-            print(f"{Colors.RED}❌ --auto requires --session{Colors.RESET}")
+    try:
+        event = _build_event_from_args(args)
+    except ValueError as exc:
+        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
+        return
+
+    event_type = str(event.get("type") or "").strip() or None
+    manager = SessionManager(db_path=str(get_memory_db_path(workspace_dir)))
+    if args.all_sessions:
+        target_sessions = manager.broadcast_event(event)
+    else:
+        try:
+            session = manager.get_session(args.session_id)
+        except KeyError as exc:
+            print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
             return
-        
+
+        matched, reason = _match_single_session_for_event(session, event_type)
+        if not matched:
+            print(f"event_type: {event.get('type')}")
+            print(f"session: {args.session_id}")
+            print(f"{Colors.YELLOW}⚠️ skipped: {reason}{Colors.RESET}")
+            return
+        target_sessions = [session]
+
+    print(f"event_type: {event.get('type')}")
+    print(f"matched_sessions: {len(target_sessions)}")
+    if not target_sessions:
+        print(f"{Colors.YELLOW}⚠️ No listening sessions matched this event.{Colors.RESET}")
+        return
+
+    if args.auto:
         print(f"{Colors.CYAN}🤖 Auto trading mode{Colors.RESET}")
         try:
             runtime = build_decision_runtime(workspace_dir, get_memory_db_path(workspace_dir))
         except FileNotFoundError as exc:
             print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
             return
-        
-        print(f"session: {args.session_id}")
 
-        result = asyncio.run(
-            run_llm_decision(
-                runtime=runtime,
-                session_id=args.session_id,
-                trading_date=datetime.now().date().isoformat(),
-            )
-        )
-        
-        print(f"\n{Colors.BOLD}Agent Analysis:{Colors.RESET}")
-        print(result["agent_analysis"])
-        
-        if result["trade_signal"]:
-            signal = result["trade_signal"]
-            print(f"\n{Colors.GREEN}📊 Trade Signal:{Colors.RESET}")
-            print(f"  action: {signal['action']}")
-            print(f"  ticker: {signal['ticker']}")
-            print(f"  quantity: {signal['quantity']}")
-            
-            if result.get("execution"):
-                print(f"{Colors.GREEN}✅ Trade executed!{Colors.RESET}")
-                print(result["execution"])
-            else:
-                print(f"{Colors.RED}❌ Trade failed: {result.get('execution_error', 'unknown error')}{Colors.RESET}")
-        else:
-            print(f"\n{Colors.DIM}No trade signal{Colors.RESET}")
-        
-        return
-
-    # Normal event trigger (non-auto)
-
-    event = {"type": args.event_type, "triggered_at": datetime.now().isoformat()}
-    if args.payload:
-        try:
-            payload = json.loads(args.payload)
-        except json.JSONDecodeError as exc:
-            print(f"{Colors.RED}❌ Invalid JSON payload: {exc}{Colors.RESET}")
-            return
-        if not isinstance(payload, dict):
-            print(f"{Colors.RED}❌ --payload must be a JSON object{Colors.RESET}")
-            return
-        event.update(payload)
-
-    manager = SessionManager(db_path=str(get_memory_db_path(workspace_dir)))
-
-    if args.all_sessions:
-        broadcaster = EventBroadcaster(session_manager=manager, trigger=_default_event_trigger)
-        results = asyncio.run(broadcaster.broadcast(event))
-        print(f"event_type: {args.event_type}")
-        print(f"matched_sessions: {len(results)}")
-        for item in results:
+        trading_date = str(event.get("date") or datetime.now().date().isoformat())
+        session_ids = [session.session_id for session in target_sessions]
+        auto_records = asyncio.run(_run_auto_event_for_sessions(runtime, session_ids, trading_date))
+        for item in auto_records:
             sid = item["session_id"]
-            status = "ok" if item.get("success") else "failed"
-            detail = item.get("result") or item.get("error", "")
-            print(f"- {sid}: {status} {detail}")
+            if not item.get("success"):
+                print(f"- {sid}: failed {item.get('error', 'unknown error')}")
+                continue
+
+            result = item["result"]
+            signal = result.get("trade_signal")
+            if signal:
+                summary = f"{signal['action']} {signal['ticker']} x{signal['quantity']}"
+            else:
+                summary = "no_trade"
+
+            execution = result.get("execution")
+            execution_error = result.get("execution_error")
+            detail = execution if execution else execution_error if execution_error else summary
+            print(f"- {sid}: ok {summary} | {detail}")
         return
 
-    try:
-        session = manager.get_session(args.session_id)
-    except KeyError as exc:
-        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
-        return
-
-    result = asyncio.run(_default_event_trigger(session, event))
-    print(f"event_type: {args.event_type}")
-    print(f"session: {args.session_id}")
-    print(result)
+    broadcaster = EventBroadcaster(session_manager=manager, trigger=_default_event_trigger)
+    if args.all_sessions:
+        results = asyncio.run(broadcaster.broadcast(event))
+    else:
+        results = [asyncio.run(broadcaster.trigger_session(target_sessions[0], event))]
+    for item in results:
+        sid = item["session_id"]
+        status = "ok" if item.get("success") else "failed"
+        detail = item.get("result") or item.get("error", "")
+        print(f"- {sid}: {status} {detail}")
 
 
 def parse_args() -> argparse.Namespace:
