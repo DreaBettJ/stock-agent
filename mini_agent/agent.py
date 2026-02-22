@@ -11,6 +11,7 @@
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from time import perf_counter
 from typing import Optional
@@ -21,7 +22,8 @@ from .llm import LLMClient
 from .logger import AgentLogger
 from .schema import Message
 from .tools.base import Tool, ToolResult
-from .utils import calculate_display_width
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -140,6 +142,7 @@ class Agent:
         # ============================================================
         self.api_total_tokens: int = 0  # API 返回的 token 总数
         self._skip_next_token_check: bool = False  # 跳过下次 token 检查
+        self._run_invocation_count: int = 0  # 当前 Agent 生命周期内 run() 调用次数
 
     # ============================================================
     # 公共方法
@@ -196,7 +199,7 @@ class Agent:
         removed_count = len(self.messages) - last_assistant_idx
         if removed_count > 0:
             self.messages = self.messages[:last_assistant_idx]
-            print(f"{Colors.DIM}   Cleaned up {removed_count} incomplete message(s){Colors.RESET}")
+            logger.info("Cleaned up %d incomplete message(s)", removed_count)
 
     # ============================================================
     # Token 估算方法
@@ -317,10 +320,12 @@ class Agent:
             return
 
         # 打印摘要开始信息
-        print(
-            f"\n{Colors.BRIGHT_YELLOW}📊 Token usage - Local estimate: {estimated_tokens}, API reported: {self.api_total_tokens}, Limit: {self.token_limit}{Colors.RESET}"
+        logger.info(
+            "Token usage - local=%d, api=%d, limit=%d; triggering summarization",
+            estimated_tokens,
+            self.api_total_tokens,
+            self.token_limit,
         )
-        print(f"{Colors.BRIGHT_YELLOW}🔄 Triggering message history summarization...{Colors.RESET}")
 
         # 记录日志事件
         self.logger.log_intercept_event(
@@ -338,7 +343,7 @@ class Agent:
 
         # 至少需要 1 条用户消息才能进行摘要
         if len(user_indices) < 1:
-            print(f"{Colors.BRIGHT_YELLOW}⚠️  Insufficient messages, cannot summarize{Colors.RESET}")
+            logger.warning("Insufficient messages, cannot summarize")
             return
 
         # 构建新的消息列表
@@ -392,9 +397,13 @@ class Agent:
         )
 
         # 打印摘要完成信息
-        print(f"{Colors.BRIGHT_GREEN}✓ Summary completed, local tokens: {estimated_tokens} → {new_tokens}{Colors.RESET}")
-        print(f"{Colors.DIM}  Structure: system + {len(user_indices)} user messages + {summary_count} summaries{Colors.RESET}")
-        print(f"{Colors.DIM}  Note: API token count will update on next LLM call{Colors.RESET}")
+        logger.info(
+            "Summary completed: local tokens %d -> %d, structure system + %d user + %d summaries",
+            estimated_tokens,
+            new_tokens,
+            len(user_indices),
+            summary_count,
+        )
 
     async def _create_summary(self, messages: list[Message], round_num: int) -> str:
         """为单轮执行创建摘要
@@ -463,11 +472,11 @@ Requirements:
             )
 
             summary_text = response.content
-            print(f"{Colors.BRIGHT_GREEN}✓ Summary for round {round_num} generated successfully{Colors.RESET}")
+            logger.info("Summary for round %d generated successfully", round_num)
             return summary_text
 
         except Exception as e:
-            print(f"{Colors.BRIGHT_RED}✗ Summary generation failed for round {round_num}: {e}{Colors.RESET}")
+            logger.exception("Summary generation failed for round %d: %s", round_num, e)
             # 如果摘要失败,使用原始内容
             return summary_content
 
@@ -497,10 +506,12 @@ Requirements:
             self.cancel_event = cancel_event
 
         # 开始新的运行,初始化日志文件
-        self.logger.start_new_run()
-        if self.logger.enabled:
-            print(f"{Colors.DIM}📝 Log file: {self.logger.get_log_file_path()}{Colors.RESET}")
-            print(f"{Colors.DIM}🧩 Intercept log: {self.logger.get_intercept_log_file_path()}{Colors.RESET}")
+        created = self.logger.start_new_run()
+        self._run_invocation_count += 1
+        self.logger.log_run_start(run_index=self._run_invocation_count, message_count=len(self.messages))
+        if self.logger.enabled and created:
+            logger.info("Run log file: %s", self.logger.get_log_file_path())
+            logger.info("Intercept log file: %s", self.logger.get_intercept_log_file_path())
 
         # 初始化步数和计时
         step = 0
@@ -514,7 +525,7 @@ Requirements:
             if self._check_cancelled():
                 self._cleanup_incomplete_messages()
                 cancel_msg = "Task cancelled by user."
-                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
+                logger.warning(cancel_msg)
                 return cancel_msg
 
             step_start_time = perf_counter()
@@ -522,15 +533,8 @@ Requirements:
             # 2. 检查并摘要消息历史 (防止上下文溢出)
             await self._summarize_messages()
 
-            # 3. 打印步骤头部 (带边框的进度提示)
-            BOX_WIDTH = 58
-            step_text = f"{Colors.BOLD}{Colors.BRIGHT_CYAN}💭 Step {step + 1}/{self.max_steps}{Colors.RESET}"
-            step_display_width = calculate_display_width(step_text)
-            padding = max(0, BOX_WIDTH - 1 - step_display_width)  # -1 for leading space
-
-            print(f"\n{Colors.DIM}╭{'─' * BOX_WIDTH}╮{Colors.RESET}")
-            print(f"{Colors.DIM}│{Colors.RESET} {step_text}{' ' * padding}{Colors.DIM}│{Colors.RESET}")
-            print(f"{Colors.DIM}╰{'─' * BOX_WIDTH}╯{Colors.RESET}")
+            # 3. 输出步骤日志
+            logger.info("Step %d/%d", step + 1, self.max_steps)
 
             # 4. 获取可用工具列表
             tool_list = list(self.tools.values())
@@ -563,11 +567,11 @@ Requirements:
                 if isinstance(e, RetryExhaustedError):
                     # 重试次数耗尽
                     error_msg = f"LLM call failed after {e.attempts} retries\nLast error: {str(e.last_exception)}"
-                    print(f"\n{Colors.BRIGHT_RED}❌ Retry failed:{Colors.RESET} {error_msg}")
+                    logger.error("Retry failed: %s", error_msg)
                 else:
                     # 其他错误
                     error_msg = f"LLM call failed: {str(e)}"
-                    print(f"\n{Colors.BRIGHT_RED}❌ Error:{Colors.RESET} {error_msg}")
+                    logger.error("LLM error: %s", error_msg)
                 return error_msg
 
             # 6. 更新 API 返回的 token 使用量
@@ -607,13 +611,11 @@ Requirements:
 
             # 9. 打印 thinking (思考过程) - 如果有的话
             if response.thinking:
-                print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
-                print(f"{Colors.DIM}{response.thinking}{Colors.RESET}")
+                logger.info("Thinking: %s", response.thinking)
 
             # 10. 打印 assistant 响应内容
             if response.content:
-                print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
-                print(f"{response.content}")
+                logger.info("Assistant: %s", response.content)
 
             # ============================================================
             # 11. 检查任务是否完成
@@ -622,14 +624,14 @@ Requirements:
             if not response.tool_calls:
                 step_elapsed = perf_counter() - step_start_time
                 total_elapsed = perf_counter() - run_start_time
-                print(f"\n{Colors.DIM}⏱️  Step {step + 1} completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
+                logger.info("Step %d completed in %.2fs (total %.2fs)", step + 1, step_elapsed, total_elapsed)
                 return response.content
 
             # 12. 执行工具调用前的取消检查
             if self._check_cancelled():
                 self._cleanup_incomplete_messages()
                 cancel_msg = "Task cancelled by user."
-                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
+                logger.warning(cancel_msg)
                 return cancel_msg
 
             # ============================================================
@@ -642,10 +644,9 @@ Requirements:
                 arguments = tool_call.function.arguments  # 工具参数
 
                 # 打印工具调用头部
-                print(f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}")
+                logger.info("Tool call: %s", function_name)
 
                 # 打印参数 (格式化显示,过长内容截断)
-                print(f"{Colors.DIM}   Arguments:{Colors.RESET}")
                 truncated_args = {}
                 for key, value in arguments.items():
                     value_str = str(value)
@@ -653,9 +654,7 @@ Requirements:
                         truncated_args[key] = value_str[:200] + "..."
                     else:
                         truncated_args[key] = value
-                args_json = json.dumps(truncated_args, indent=2, ensure_ascii=False)
-                for line in args_json.split("\n"):
-                    print(f"   {Colors.DIM}{line}{Colors.RESET}")
+                logger.info("Tool arguments: %s", json.dumps(truncated_args, ensure_ascii=False))
 
                 # 记录工具执行前的事件日志
                 self.logger.log_intercept_event(
@@ -719,10 +718,10 @@ Requirements:
                 if result.success:
                     result_text = result.content
                     if len(result_text) > 300:
-                        result_text = result_text[:300] + f"{Colors.DIM}...{Colors.RESET}"
-                    print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result_text}")
+                        result_text = result_text[:300] + "..."
+                    logger.info("Tool result: %s", result_text)
                 else:
-                    print(f"{Colors.BRIGHT_RED}✗ Error:{Colors.RESET} {Colors.RED}{result.error}{Colors.RESET}")
+                    logger.error("Tool error: %s", result.error)
 
                 # 14. 将工具结果作为消息添加到历史
                 tool_msg = Message(
@@ -737,13 +736,13 @@ Requirements:
                 if self._check_cancelled():
                     self._cleanup_incomplete_messages()
                     cancel_msg = "Task cancelled by user."
-                    print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
+                    logger.warning(cancel_msg)
                     return cancel_msg
 
             # 打印本步完成信息
             step_elapsed = perf_counter() - step_start_time
             total_elapsed = perf_counter() - run_start_time
-            print(f"\n{Colors.DIM}⏱️  Step {step + 1} completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
+            logger.info("Step %d completed in %.2fs (total %.2fs)", step + 1, step_elapsed, total_elapsed)
 
             # 步数 +1,继续循环
             step += 1
@@ -752,7 +751,7 @@ Requirements:
         # 达到最大步数,任务未能完成
         # ============================================================
         error_msg = f"Task couldn't be completed after {self.max_steps} steps."
-        print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
+        logger.warning(error_msg)
         return error_msg
 
     # ============================================================

@@ -35,10 +35,17 @@ class AgentLogger:
         """Bind logger output to one session id."""
         self.session_id = str(session_id) if session_id is not None else None
 
-    def start_new_run(self):
-        """Start new run, create new log file"""
+    def start_new_run(self, force_new: bool = False) -> bool:
+        """Start logging for one run.
+
+        Returns:
+            True if a new log file is created this call; False if reusing existing files.
+        """
         if not self.enabled:
-            return
+            return False
+
+        if self.log_file is not None and self.intercept_log_file is not None and not force_new:
+            return False
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         sid = self.session_id or "unknown"
@@ -56,6 +63,19 @@ class AgentLogger:
             f.write(f"Agent Run Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Session ID: {self.session_id or 'unknown'}\n")
             f.write("=" * 80 + "\n\n")
+        return True
+
+    def log_run_start(self, run_index: int, message_count: int):
+        """Write a visible boundary marker for each agent.run() invocation."""
+        if not self.enabled:
+            return
+        self.log_index += 1
+        content = (
+            f"Run Index: {run_index}\n"
+            f"Message Count At Start: {message_count}\n"
+            f"Started At: {datetime.now().isoformat(timespec='milliseconds')}"
+        )
+        self._write_log("RUN_START", content)
 
     def log_intercept_event(self, event: str, data: dict[str, Any]):
         """Log one interception event as a single JSONL line."""

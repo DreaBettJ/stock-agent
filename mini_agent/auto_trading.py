@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -13,6 +14,8 @@ from .llm import LLMClient
 from .schema import LLMProvider
 from .session import SessionManager
 from .tools.kline_db_tool import KLineDB
+
+logger = logging.getLogger(__name__)
 
 
 class AutoTradingWorkflow:
@@ -70,6 +73,14 @@ class AutoTradingWorkflow:
             positions=positions,
             date=trading_date,
         )
+        logger.info(
+            "Daily review prepared: session=%s, date=%s, positions=%d, top_gainers=%d",
+            session_id,
+            trading_date,
+            len(positions),
+            len(market_data.get("top_gainers", [])),
+        )
+        logger.info("Prompt to LLM (session=%s, date=%s):\n%s", session_id, trading_date, prompt)
         
         # 5. Call Agent for analysis
         llm = LLMClient(
@@ -83,6 +94,7 @@ class AutoTradingWorkflow:
             system_prompt=session.system_prompt,
             tools=[],  # Agent will analyze only, no tools
             max_steps=3,
+            session_id=session_id,
         )
         
         # Add user message with context
@@ -90,6 +102,7 @@ class AutoTradingWorkflow:
         
         # Run agent
         result = await agent.run()
+        logger.info("LLM analysis completed (session=%s, date=%s): %s", session_id, trading_date, result)
         
         # 6. Parse agent response for trade signal
         trade_signal = self._parse_trade_signal(result, session)
@@ -102,6 +115,13 @@ class AutoTradingWorkflow:
                 quantity=trade_signal["quantity"],
                 trade_date=trading_date,
             )
+        logger.info(
+            "Daily review parsed signal: session=%s, date=%s, signal=%s, executed=%s",
+            session_id,
+            trading_date,
+            trade_signal,
+            bool(execution and execution.success),
+        )
         
         return {
             "session_id": session_id,

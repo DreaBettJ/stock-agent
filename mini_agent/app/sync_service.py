@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import subprocess
 
 from mini_agent.tools.kline_db_tool import KLineDB
 
@@ -82,3 +83,41 @@ def build_cron_lines(cwd: Path, start: str) -> list[str]:
         f"5 16 * * 1-5 cd {cwd} && mini-agent event trigger daily_review --all",
     ]
 
+
+def install_cron_lines(cwd: Path, start: str) -> tuple[bool, str]:
+    """Install/replace mini-agent cron block in current user's crontab."""
+    begin = "# >>> mini-agent auto-sync >>>"
+    end = "# <<< mini-agent auto-sync <<<"
+    block_lines = [begin, *build_cron_lines(cwd, start), end]
+    new_block = "\n".join(block_lines)
+
+    # Read current crontab. "no crontab for user" is treated as empty.
+    current = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if current.returncode != 0:
+        stderr = (current.stderr or "").lower()
+        if "no crontab" in stderr:
+            old_text = ""
+        else:
+            return False, (current.stderr or current.stdout or "failed to read current crontab").strip()
+    else:
+        old_text = current.stdout or ""
+
+    lines = old_text.splitlines()
+    kept: list[str] = []
+    inside_block = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == begin:
+            inside_block = True
+            continue
+        if stripped == end:
+            inside_block = False
+            continue
+        if not inside_block:
+            kept.append(line)
+
+    merged = "\n".join([*kept, "", new_block]).strip() + "\n"
+    write = subprocess.run(["crontab", "-"], input=merged, capture_output=True, text=True)
+    if write.returncode != 0:
+        return False, (write.stderr or write.stdout or "failed to write crontab").strip()
+    return True, "cron installed"

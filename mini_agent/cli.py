@@ -34,7 +34,8 @@ from prompt_toolkit.styles import Style
 from mini_agent import LLMClient
 from mini_agent.agent import Agent
 from mini_agent.app.decision_service import build_decision_runtime, run_llm_decision
-from mini_agent.app.sync_service import build_cron_lines, resolve_ticker_universe, sync_kline_data
+from mini_agent.app.memory_service import build_session_memory_snapshot, load_recent_session_memories
+from mini_agent.app.sync_service import build_cron_lines, install_cron_lines, resolve_ticker_universe, sync_kline_data
 from mini_agent.config import Config
 from mini_agent.event_broadcaster import EventBroadcaster
 from mini_agent.paths import get_default_memory_db_path, resolve_kline_db_path
@@ -334,9 +335,9 @@ async def _persist_turn_memory(
             session_id=str(session_id),
         )
         if not result.success:
-            print(f"{Colors.YELLOW}⚠️ Memory persist failed: {result.error}{Colors.RESET}")
+            logging.getLogger(__name__).warning("Memory persist failed (session=%s): %s", session_id, result.error)
     except Exception as exc:  # pragma: no cover - defensive
-        print(f"{Colors.YELLOW}⚠️ Memory persist exception: {exc}{Colors.RESET}")
+        logging.getLogger(__name__).exception("Memory persist exception (session=%s): %s", session_id, exc)
 
 
 def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> None:
@@ -523,13 +524,26 @@ def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> No
             return f"LLM_DECISION_EXECUTED {result['execution']}"
         return f"LLM_DECISION_NO_TRADE {result.get('agent_analysis', '')[:120]}"
 
-    broadcaster = EventBroadcaster(session_manager=runtime.session_manager, trigger=_llm_backtest_trigger)
+    async def _mock_backtest_trigger(session, event: dict) -> str:
+        _ = session
+        return f"MOCK_DECISION_NO_TRADE date={event.get('date')}"
+
+    trigger = _mock_backtest_trigger if getattr(args, "no_llm", False) else _llm_backtest_trigger
+    broadcaster = EventBroadcaster(session_manager=runtime.session_manager, trigger=trigger)
     engine = BacktestEngine(runtime.session_manager, runtime.kline_db, broadcaster)
 
     if args.backtest_command == "run":
+        import random
+
+        random.seed(args.seed)
         print(f"{Colors.CYAN}🔄 Running backtest...{Colors.RESET}")
         print(f"session: {args.session}")
         print(f"period: {args.start} ~ {args.end}")
+        print(f"seed: {args.seed}")
+        if getattr(args, "no_llm", False):
+            print(f"{Colors.YELLOW}mode: mock decision (--no-llm){Colors.RESET}")
+        else:
+            print("mode: llm decision")
 
         result = asyncio.run(engine.run(args.session, args.start, args.end))
 
@@ -793,6 +807,12 @@ Examples:
     backtest_run.add_argument("--session", required=True, type=int, help="Session ID for backtest")
     backtest_run.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
     backtest_run.add_argument("--end", required=True, help="End date YYYY-MM-DD")
+    backtest_run.add_argument("--seed", type=int, default=42, help="Random seed for reproducible local runs")
+    backtest_run.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Run backtest with mock decision (no external LLM call, for fast local verification)",
+    )
 
     backtest_result = backtest_subparsers.add_parser("result", help="Show backtest result")
     backtest_result.add_argument("--session", required=True, type=int, help="Session ID")
@@ -821,6 +841,7 @@ Examples:
     sync_parser.add_argument("--start", default="1991-01-01", help="Start date YYYY-MM-DD")
     sync_parser.add_argument("--end", default=None, help="End date YYYY-MM-DD (default: today)")
     sync_parser.add_argument("--cron", action="store_true", help="Print recommended crontab entries")
+    sync_parser.add_argument("--install-cron", action="store_true", help="Install/update recommended crontab entries")
 
     return parser.parse_args()
 
@@ -1151,7 +1172,13 @@ async def run_agent(workspace_dir: Path, task: str = None):
     if task:
         print(f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Executing task...{Colors.RESET}\n")
         await _persist_turn_memory(tools, session_id=session_id, category="conversation_user", content=task)
-        agent.add_user_message(task)
+        mem_snapshot = build_session_memory_snapshot(
+            load_recent_session_memories(get_memory_db_path(workspace_dir), session_id=session_id, limit=12)
+        )
+        if mem_snapshot:
+            agent.add_user_message(f"[Session Memory]\n{mem_snapshot}\n\n[User Request]\n{task}")
+        else:
+            agent.add_user_message(task)
         try:
             final_reply = await agent.run()
             await _persist_turn_memory(
@@ -1300,7 +1327,13 @@ async def run_agent(workspace_dir: Path, task: str = None):
                 category="conversation_user",
                 content=user_input,
             )
-            agent.add_user_message(user_input)
+            mem_snapshot = build_session_memory_snapshot(
+                load_recent_session_memories(get_memory_db_path(workspace_dir), session_id=session_id, limit=12)
+            )
+            if mem_snapshot:
+                agent.add_user_message(f"[Session Memory]\n{mem_snapshot}\n\n[User Request]\n{user_input}")
+            else:
+                agent.add_user_message(user_input)
 
             # Create cancellation event
             cancel_event = asyncio.Event()
@@ -1430,6 +1463,13 @@ def handle_sync_command(args: argparse.Namespace, workspace_dir: Path) -> None:
         print("Recommended crontab entries:")
         for line in build_cron_lines(Path.cwd(), args.start):
             print(line)
+        return
+    if args.install_cron:
+        ok, detail = install_cron_lines(Path.cwd(), args.start)
+        if ok:
+            print(f"{Colors.GREEN}✅ {detail}{Colors.RESET}")
+        else:
+            print(f"{Colors.RED}❌ Failed to install cron: {detail}{Colors.RESET}")
         return
 
     try:

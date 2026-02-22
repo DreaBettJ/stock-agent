@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import logging
 import math
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -13,6 +14,8 @@ from typing import Any
 from .event_broadcaster import EventBroadcaster
 from .session import SessionManager
 from .tools.kline_db_tool import KLineDB
+
+logger = logging.getLogger(__name__)
 
 
 class PerformanceAnalyzer:
@@ -162,17 +165,27 @@ class BacktestEngine:
         """Run backtest for a session."""
         # 1) 校验 session 与交易日历。
         session = self.session_manager.get_session(session_id)
+        logger.info(
+            "Backtest start: session=%s, mode=%s, range=%s~%s",
+            session.session_id,
+            session.mode,
+            start_date,
+            end_date,
+        )
         
         # Get trading days in range
         trading_days = self.kline_db.get_trading_days(start_date, end_date)
         if not trading_days:
+            logger.warning("Backtest aborted: no trading days in range %s~%s", start_date, end_date)
             return {"error": f"No trading days in range {start_date} to {end_date}"}
+        logger.info("Backtest trading days loaded: %d", len(trading_days))
 
         # 2) 初始化内存中的结果容器。
         equity_curve = []
 
         # 3) 保证重复回测可复现：清理该 session 旧的模拟仓位与成交。
         self._reset_session_state(session.session_id)
+        logger.info("Backtest state reset for session=%s", session.session_id)
 
         # 4) 重置 session 运行态。
         initial_cash = session.initial_capital
@@ -180,21 +193,36 @@ class BacktestEngine:
 
         # 标记为运行中并开启监听，便于事件驱动回调。
         self.session_manager.start_session(session.session_id)
+        logger.info("Session started for backtest: session=%s", session.session_id)
 
         # 5) 按交易日逐日回放。
-        for trading_day in trading_days:
+        total_days = len(trading_days)
+        for idx, trading_day in enumerate(trading_days, 1):
+            if idx <= 5 or idx == total_days or idx % 20 == 0:
+                logger.info("Backtest replay day %d/%d: %s", idx, total_days, trading_day)
             self.session_manager.update_current_date(session.session_id, trading_day)
             
             # Generate event
             event = self.historical_generator.generate_daily_review_event(trading_day)
+            if event.get("error"):
+                logger.warning("Generated event with warning on %s: %s", trading_day, event.get("error"))
             
             # Trigger ONLY current session to avoid cross-session contamination.
             trigger_session = getattr(self.event_broadcaster, "trigger_session", None)
             if trigger_session is not None and inspect.iscoroutinefunction(trigger_session):
-                await trigger_session(session, event)
+                trigger_result = await trigger_session(session, event)
+                if idx <= 5 or idx == total_days or idx % 20 == 0:
+                    logger.info(
+                        "Event trigger result day %s: success=%s detail=%s",
+                        trading_day,
+                        trigger_result.get("success"),
+                        trigger_result.get("result") or trigger_result.get("error", ""),
+                    )
             else:
                 # 兼容兜底：自定义 broadcaster 没有 trigger_session 时走原广播接口。
-                await self.event_broadcaster.broadcast(event)
+                trigger_results = await self.event_broadcaster.broadcast(event)
+                if idx <= 5 or idx == total_days or idx % 20 == 0:
+                    logger.info("Broadcast result day %s: matched=%d", trading_day, len(trigger_results))
             
             # 记录当日权益：按当日可见价格估值（避免前视偏差）。
             current_cash = self.session_manager.get_session(session.session_id).current_cash
@@ -207,15 +235,33 @@ class BacktestEngine:
                 "position_value": position_value,
                 "value": total_value,
             })
+            if idx <= 5 or idx == total_days or idx % 20 == 0:
+                logger.info(
+                    "Equity day %s: cash=%.2f, pos=%.2f, total=%.2f",
+                    trading_day,
+                    current_cash,
+                    position_value,
+                    total_value,
+                )
 
         # 6) 结束 session 并汇总结果。
         self.session_manager.finish_session(session.session_id)
+        logger.info("Session finished for backtest: session=%s", session.session_id)
 
         # Get all trades
         all_trades = self._get_session_trades(session.session_id)
+        logger.info("Backtest trades collected: %d", len(all_trades))
 
         # Calculate performance
         performance = PerformanceAnalyzer.calculate(all_trades, equity_curve)
+        logger.info(
+            "Backtest completed: session=%s, days=%d, total_return=%.6f, sharpe=%.4f, max_drawdown=%.6f",
+            session.session_id,
+            len(trading_days),
+            float(performance.get("total_return", 0.0) or 0.0),
+            float(performance.get("sharpe_ratio", 0.0) or 0.0),
+            float(performance.get("max_drawdown", 0.0) or 0.0),
+        )
 
         return {
             "session_id": session.session_id,
