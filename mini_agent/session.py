@@ -25,7 +25,6 @@ class ExperimentSession:
     mode: SessionMode
     initial_capital: float = 100000.0
     current_cash: float = 100000.0
-    positions: dict[str, dict[str, float]] = field(default_factory=dict)
     status: SessionStatus = "stopped"
     is_listening: bool = False
     backtest_start: date | None = None

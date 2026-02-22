@@ -151,7 +151,10 @@ class SimulateTradeTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "session_id": {"type": "string", "description": "Experiment session id"},
+                "session_id": {
+                    "oneOf": [{"type": "integer"}, {"type": "string"}],
+                    "description": "Experiment session id",
+                },
                 "action": {"type": "string", "enum": ["buy", "sell"], "description": "Trade action"},
                 "ticker": {"type": "string", "description": "Stock code"},
                 "quantity": {"type": "integer", "description": "Shares to trade"},
@@ -175,7 +178,7 @@ class SimulateTradeTool(Tool):
             symbol = self.kline_db.normalize_ticker(ticker)
             action_normalized = action.strip().lower()
             
-            # Buy uses next open price, Sell uses close price (today)
+            # Buy/Sell both use next open price to avoid look-ahead bias in backtest.
             if action_normalized == "buy":
                 exec_price = self.kline_db.get_next_open_price(symbol, trade_date)
                 gross_amount = exec_price * quantity
@@ -193,8 +196,7 @@ class SimulateTradeTool(Tool):
                 profit = None
 
             elif action_normalized == "sell":
-                # For sell, use today's close price
-                exec_price = self.kline_db.get_latest_price(symbol)
+                exec_price = self.kline_db.get_next_open_price(symbol, trade_date)
                 gross_amount = exec_price * quantity
                 old_position = self.store.get_position(session_id, symbol)
                 if old_position is None or int(old_position["quantity"]) < quantity:

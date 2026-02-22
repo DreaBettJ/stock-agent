@@ -30,26 +30,58 @@ class _NoteStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            # New memory table aligned with PRD.
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS notes (
+                CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'note',
                     category TEXT NOT NULL,
-                    content TEXT NOT NULL
+                    content TEXT NOT NULL,
+                    importance INTEGER DEFAULT 0,
+                    is_deleted INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
                 )
                 """
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_category ON notes(category)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id, is_deleted)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)")
+
+            # Legacy compatibility: migrate old notes table into memories.
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='notes' LIMIT 1").fetchone():
+                conn.execute(
+                    """
+                    INSERT INTO memories (session_id, role, category, content, importance, is_deleted, created_at)
+                    SELECT n.session_id, 'note', n.category, n.content, 0, 0, n.timestamp
+                    FROM notes n
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM memories m
+                        WHERE m.session_id = n.session_id
+                          AND m.category = n.category
+                          AND m.content = n.content
+                          AND m.created_at = n.timestamp
+                    )
+                    """
+                )
             conn.commit()
 
-    def insert(self, session_id: str, category: str, content: str, timestamp: str) -> None:
+    def insert(
+        self,
+        session_id: str,
+        category: str,
+        content: str,
+        timestamp: str,
+        importance: int = 0,
+        role: str = "note",
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO notes (session_id, timestamp, category, content) VALUES (?, ?, ?, ?)",
-                (session_id, timestamp, category, content),
+                """
+                INSERT INTO memories (session_id, role, category, content, importance, is_deleted, created_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """,
+                (session_id, role, category, content, int(importance), timestamp),
             )
             conn.commit()
 
@@ -59,7 +91,11 @@ class _NoteStore:
         session_id: str | None = None,
         limit: int = 200,
     ) -> list[sqlite3.Row]:
-        sql = "SELECT id, session_id, timestamp, category, content FROM notes"
+        sql = """
+            SELECT id, session_id, created_at, category, content, importance, role
+            FROM memories
+            WHERE is_deleted = 0
+        """
         clauses = []
         params: list[Any] = []
 
@@ -71,7 +107,7 @@ class _NoteStore:
             params.append(session_id)
 
         if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
+            sql += " AND " + " AND ".join(clauses)
 
         sql += " ORDER BY id ASC LIMIT ?"
         params.append(max(1, min(limit, 2000)))
@@ -91,7 +127,7 @@ class SessionNoteTool(Tool):
 
     @property
     def name(self) -> str:
-        return "record_note"
+        return "record_memory"
 
     @property
     def description(self) -> str:
@@ -113,6 +149,11 @@ class SessionNoteTool(Tool):
                     "type": "string",
                     "description": "Optional category/tag for this note (e.g., user_preference, project_info, decision)",
                 },
+                "importance": {
+                    "type": "integer",
+                    "description": "Importance score (0-10). High-importance memory should be retained.",
+                    "default": 0,
+                },
                 "session_id": {
                     "type": "string",
                     "description": "Optional override session_id. If omitted, tool default session_id is used.",
@@ -121,18 +162,32 @@ class SessionNoteTool(Tool):
             "required": ["content"],
         }
 
-    async def execute(self, content: str, category: str = "general", session_id: str | None = None) -> ToolResult:
+    async def execute(
+        self,
+        content: str,
+        category: str = "general",
+        importance: int = 0,
+        session_id: str | None = None,
+    ) -> ToolResult:
         try:
             sid = session_id or self.session_id
             ts = datetime.now().isoformat()
-            self.store.insert(session_id=sid, category=category, content=content, timestamp=ts)
+            importance = max(0, min(int(importance), 10))
+            self.store.insert(
+                session_id=sid,
+                category=category,
+                content=content,
+                timestamp=ts,
+                importance=importance,
+                role="note",
+            )
 
             return ToolResult(
                 success=True,
-                content=f"Recorded note: {content} (category: {category}, session_id: {sid})",
+                content=f"Recorded memory: {content} (category: {category}, importance: {importance}, session_id: {sid})",
             )
         except Exception as e:
-            return ToolResult(success=False, content="", error=f"Failed to record note: {str(e)}")
+            return ToolResult(success=False, content="", error=f"Failed to record memory: {str(e)}")
 
 
 class RecallNoteTool(Tool):
@@ -145,7 +200,7 @@ class RecallNoteTool(Tool):
 
     @property
     def name(self) -> str:
-        return "recall_notes"
+        return "recall_memories"
 
     @property
     def description(self) -> str:
@@ -205,11 +260,15 @@ class RecallNoteTool(Tool):
 
             formatted = []
             for idx, note in enumerate(notes, 1):
-                timestamp = note["timestamp"]
+                timestamp = note["created_at"]
                 cat = note["category"]
                 sid = note["session_id"]
                 content = note["content"]
-                formatted.append(f"{idx}. [{cat}] {content}\n   (session_id: {sid}, recorded at {timestamp})")
+                importance = int(note["importance"]) if note["importance"] is not None else 0
+                formatted.append(
+                    f"{idx}. [{cat}] {content}\n"
+                    f"   (session_id: {sid}, importance: {importance}, recorded at {timestamp})"
+                )
 
             return ToolResult(success=True, content="Recorded Notes:\n" + "\n".join(formatted))
         except Exception as e:

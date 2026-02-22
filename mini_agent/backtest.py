@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import math
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -55,11 +56,27 @@ class PerformanceAnalyzer:
         total_loss = abs(sum(t["profit"] for t in sell_trades if t.get("profit", 0) < 0))
         profit_factor = total_profit / total_loss if total_loss > 0 else 0
 
+        # Sharpe ratio (daily, risk-free rate assumed 0)
+        daily_returns: list[float] = []
+        for i in range(1, len(equity_curve)):
+            prev = equity_curve[i - 1]["value"]
+            curr = equity_curve[i]["value"]
+            if prev > 0:
+                daily_returns.append((curr - prev) / prev)
+        if daily_returns:
+            mean_ret = sum(daily_returns) / len(daily_returns)
+            variance = sum((r - mean_ret) ** 2 for r in daily_returns) / len(daily_returns)
+            std_ret = math.sqrt(variance)
+            sharpe_ratio = (mean_ret / std_ret) * math.sqrt(252) if std_ret > 1e-12 else 0.0
+        else:
+            sharpe_ratio = 0.0
+
         return {
             "initial_capital": initial_value,
             "final_value": final_value,
             "total_return": total_return,
             "annual_return": annual_return,
+            "sharpe_ratio": sharpe_ratio,
             "max_drawdown": -max_drawdown,
             "win_rate": win_rate,
             "profit_factor": profit_factor,
@@ -153,7 +170,6 @@ class BacktestEngine:
 
         # 2) 初始化内存中的结果容器。
         equity_curve = []
-        all_trades = []
 
         # 3) 保证重复回测可复现：清理该 session 旧的模拟仓位与成交。
         self._reset_session_state(session.session_id)

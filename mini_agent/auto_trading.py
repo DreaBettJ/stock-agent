@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from .agent import Agent
+from .config import Config
 from .event_broadcaster import EventBroadcaster
 from .llm import LLMClient
 from .schema import LLMProvider
@@ -29,38 +30,38 @@ class AutoTradingWorkflow:
         self.kline_db = kline_db
         self.llm_provider = llm_provider
         
-        # Load API key from config if not provided
+        # Load API key/model/provider from unified config if not provided.
         if api_key is None:
-            import yaml
-            from pathlib import Path
-            # Try multiple config locations
-            for config_path in [
-                Path(__file__).parent.parent / "config.yaml",
-                Path(__file__).parent / "config.yaml",
-            ]:
-                if config_path.exists():
-                    with open(config_path) as f:
-                        cfg = yaml.safe_load(f)
-                        api_key = cfg.get("api_key")
-                        if api_key:
-                            break
+            try:
+                cfg = Config.from_yaml(Config.get_default_config_path())
+                api_key = cfg.llm.api_key
+                self.llm_provider = cfg.llm.provider
+                model = cfg.llm.model
+            except Exception:
+                # Keep passed-in defaults if config is unavailable.
+                pass
         
-        self.api_key = api_key
         self.api_key = api_key
         self.model = model
 
-    async def trigger_daily_review(self, session_id: str) -> dict[str, Any]:
-        """Trigger daily review for a session and auto-trade if signal generated."""
+    async def trigger_daily_review(
+        self,
+        session_id: int | str,
+        trading_date: str | None = None,
+        auto_execute: bool = False,
+        trade_executor: Any | None = None,
+    ) -> dict[str, Any]:
+        """Trigger daily review for a session and optionally auto-execute trade."""
         
         # 1. Get session
         session = self.session_manager.get_session(session_id)
         
         # 2. Prepare market data
-        trading_date = datetime.now().strftime("%Y-%m-%d")
+        trading_date = trading_date or datetime.now().strftime("%Y-%m-%d")
         market_data = self._prepare_market_data(trading_date)
         
         # 3. Prepare positions
-        positions = self._get_positions(session_id)
+        positions = self._get_positions(session_id, as_of_date=trading_date)
         
         # 4. Build prompt with strategy
         prompt = self._build_review_prompt(
@@ -92,12 +93,23 @@ class AutoTradingWorkflow:
         
         # 6. Parse agent response for trade signal
         trade_signal = self._parse_trade_signal(result, session)
+        execution = None
+        if auto_execute and trade_signal and trade_executor is not None:
+            execution = await trade_executor.execute(
+                session_id=session_id,
+                action=trade_signal["action"],
+                ticker=trade_signal["ticker"],
+                quantity=trade_signal["quantity"],
+                trade_date=trading_date,
+            )
         
         return {
             "session_id": session_id,
             "date": trading_date,
             "agent_analysis": result,
             "trade_signal": trade_signal,
+            "execution": execution.content if execution and execution.success else None,
+            "execution_error": execution.error if execution and not execution.success else None,
         }
 
     def _prepare_market_data(self, date: str) -> dict[str, Any]:
@@ -137,7 +149,7 @@ class AutoTradingWorkflow:
             for r in rows if r["change_pct"] is not None
         ]
 
-    def _get_positions(self, session_id: int | str) -> list[dict]:
+    def _get_positions(self, session_id: int | str, as_of_date: str | None = None) -> list[dict]:
         """Get current positions with kline data."""
         import sqlite3
         
@@ -160,7 +172,10 @@ class AutoTradingWorkflow:
         for r in rows:
             # Get current price
             try:
-                current_price = self.kline_db.get_latest_price(r["ticker"])
+                if as_of_date:
+                    current_price = self.kline_db.get_price_on_or_before(r["ticker"], as_of_date)
+                else:
+                    current_price = self.kline_db.get_latest_price(r["ticker"])
             except Exception:
                 current_price = r["avg_cost"]
             
@@ -169,8 +184,13 @@ class AutoTradingWorkflow:
             
             # Get kline data (last 20 days)
             from datetime import datetime, timedelta
-            end_date = datetime.now().strftime("%Y-%m-%d")
-            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            if as_of_date:
+                end_date = as_of_date
+                dt = datetime.fromisoformat(as_of_date)
+                start_date = (dt - timedelta(days=30)).strftime("%Y-%m-%d")
+            else:
+                end_date = datetime.now().strftime("%Y-%m-%d")
+                start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
             
             try:
                 klines = self.kline_db.get_kline(r["ticker"], start_date, end_date)

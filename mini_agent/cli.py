@@ -23,7 +23,6 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List
-from uuid import uuid4
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -34,6 +33,8 @@ from prompt_toolkit.styles import Style
 
 from mini_agent import LLMClient
 from mini_agent.agent import Agent
+from mini_agent.app.decision_service import build_decision_runtime, run_llm_decision
+from mini_agent.app.sync_service import build_cron_lines, resolve_ticker_universe, sync_kline_data
 from mini_agent.config import Config
 from mini_agent.event_broadcaster import EventBroadcaster
 from mini_agent.paths import get_default_memory_db_path, resolve_kline_db_path
@@ -46,7 +47,6 @@ from mini_agent.tools.mcp_loader import cleanup_mcp_connections, load_mcp_tools_
 from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
 from mini_agent.tools.sim_trade_tool import SimulateTradeTool
 from mini_agent.tools.stock_tools import create_a_share_tools
-from mini_agent.tools.trade_tool import create_trade_tools
 from mini_agent.tools.skill_tool import create_skill_tools
 from mini_agent.tools.kline_db_tool import KLineDB
 from mini_agent.utils import calculate_display_width
@@ -317,7 +317,7 @@ def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> Non
     if args.session_command == "create":
         session_id = manager.create_session(
             name=args.name,
-            system_prompt=args.prompt or "You are a helpful trading assistant.",
+            system_prompt=args.prompt,
             mode=args.mode,
             initial_capital=args.initial_capital,
             event_filter=args.event_filter or [],
@@ -475,19 +475,27 @@ async def _default_event_trigger(session, event: dict) -> str:
 def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle backtest subcommands."""
     from .backtest import BacktestEngine, PerformanceAnalyzer
-    from .tools.kline_db_tool import KLineDB
 
-    db_path = get_memory_db_path(workspace_dir)
-    # Resolve stock_kline.db with workspace fallback
-    kline_db_path = resolve_kline_db_path(workspace_dir)
-    if not kline_db_path.exists():
-        print(f"{Colors.RED}❌ K-line database not found: {kline_db_path}{Colors.RESET}")
+    try:
+        runtime = build_decision_runtime(workspace_dir, get_memory_db_path(workspace_dir))
+    except FileNotFoundError as exc:
+        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
         return
-    
-    session_manager = SessionManager(db_path=str(db_path))
-    kline_db = KLineDB(db_path=str(kline_db_path))
-    broadcaster = EventBroadcaster(session_manager=session_manager, trigger=_default_event_trigger)
-    engine = BacktestEngine(session_manager, kline_db, broadcaster)
+
+    async def _llm_backtest_trigger(session, event: dict) -> str:
+        result = await run_llm_decision(
+            runtime=runtime,
+            session_id=session.session_id,
+            trading_date=str(event.get("date") or ""),
+        )
+        if result.get("execution_error"):
+            return f"LLM_DECISION_FAIL {result['execution_error']}"
+        if result.get("execution"):
+            return f"LLM_DECISION_EXECUTED {result['execution']}"
+        return f"LLM_DECISION_NO_TRADE {result.get('agent_analysis', '')[:120]}"
+
+    broadcaster = EventBroadcaster(session_manager=runtime.session_manager, trigger=_llm_backtest_trigger)
+    engine = BacktestEngine(runtime.session_manager, runtime.kline_db, broadcaster)
 
     if args.backtest_command == "run":
         print(f"{Colors.CYAN}🔄 Running backtest...{Colors.RESET}")
@@ -513,6 +521,7 @@ def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> No
         print(f"Final:         ¥{perf.get('final_value', 0):,.2f}")
         print(f"Total Return:  {perf.get('total_return', 0)*100:.2f}%")
         print(f"Annual Return: {perf.get('annual_return', 0)*100:.2f}%")
+        print(f"Sharpe:       {perf.get('sharpe_ratio', 0):.2f}")
         print(f"Max Drawdown: {perf.get('max_drawdown', 0)*100:.2f}%")
         print(f"Win Rate:     {perf.get('win_rate', 0)*100:.1f}%")
         print(f"Profit Factor:{perf.get('profit_factor', 0):.2f}")
@@ -547,37 +556,21 @@ def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
             return
         
         print(f"{Colors.CYAN}🤖 Auto trading mode{Colors.RESET}")
-        
-        from .auto_trading import AutoTradingWorkflow
-        
-        # Load API key from config.yaml
-        api_key = None
-        config_path = Path(__file__).parent / "config.yaml"
-        if config_path.exists():
-            import yaml
-            with open(config_path) as f:
-                cfg = yaml.safe_load(f)
-                api_key = cfg.get("api_key")
-        
-        db_path = get_memory_db_path(workspace_dir)
-        kline_db_path = resolve_kline_db_path(workspace_dir)
-        
-        if not kline_db_path.exists():
-            print(f"{Colors.RED}❌ K-line database not found: {kline_db_path}{Colors.RESET}")
+        try:
+            runtime = build_decision_runtime(workspace_dir, get_memory_db_path(workspace_dir))
+        except FileNotFoundError as exc:
+            print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
             return
         
-        session_manager = SessionManager(db_path=str(db_path))
-        kline_db = KLineDB(db_path=str(kline_db_path))
-        
-        workflow = AutoTradingWorkflow(
-            session_manager=session_manager,
-            kline_db=kline_db,
-            api_key=api_key,
-        )
-        
         print(f"session: {args.session_id}")
-        
-        result = asyncio.run(workflow.trigger_daily_review(args.session_id))
+
+        result = asyncio.run(
+            run_llm_decision(
+                runtime=runtime,
+                session_id=args.session_id,
+                trading_date=datetime.now().date().isoformat(),
+            )
+        )
         
         print(f"\n{Colors.BOLD}Agent Analysis:{Colors.RESET}")
         print(result["agent_analysis"])
@@ -589,28 +582,11 @@ def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
             print(f"  ticker: {signal['ticker']}")
             print(f"  quantity: {signal['quantity']}")
             
-            # Auto execute trade
-            print(f"\n{Colors.YELLOW}⚡ Executing trade...{Colors.RESET}")
-            from .tools.sim_trade_tool import SimulateTradeTool
-            
-            trade_tool = SimulateTradeTool(
-                db_path=str(db_path),
-                kline_db_path=str(kline_db_path),
-            )
-            
-            exec_result = asyncio.run(trade_tool.execute(
-                session_id=args.session_id,
-                action=signal["action"],
-                ticker=signal["ticker"],
-                quantity=signal["quantity"],
-                trade_date=result["date"],
-            ))
-            
-            if exec_result.success:
+            if result.get("execution"):
                 print(f"{Colors.GREEN}✅ Trade executed!{Colors.RESET}")
-                print(exec_result.content)
+                print(result["execution"])
             else:
-                print(f"{Colors.RED}❌ Trade failed: {exec_result.error}{Colors.RESET}")
+                print(f"{Colors.RED}❌ Trade failed: {result.get('execution_error', 'unknown error')}{Colors.RESET}")
         else:
             print(f"\n{Colors.DIM}No trade signal{Colors.RESET}")
         
@@ -715,7 +691,7 @@ Examples:
 
     session_create = session_subparsers.add_parser("create", help="Create a session")
     session_create.add_argument("--name", required=True, help="Session name")
-    session_create.add_argument("--prompt", default="", help="System prompt (optional)")
+    session_create.add_argument("--prompt", required=True, help="System prompt")
     session_create.add_argument(
         "--mode",
         default="simulation",
@@ -808,6 +784,14 @@ Examples:
     health_parser = subparsers.add_parser("health", help="Health check commands")
     health_subparsers = health_parser.add_subparsers(dest="health_command", help="Health actions")
     health_check = health_subparsers.add_parser("check", help="Run health check")
+
+    # sync command
+    sync_parser = subparsers.add_parser("sync", help="Sync A-share daily K-line data")
+    sync_parser.add_argument("tickers", nargs="?", default="", help="Comma-separated tickers, e.g. 600519,000001")
+    sync_parser.add_argument("--all", action="store_true", help="Sync all A-share tickers")
+    sync_parser.add_argument("--start", default="1991-01-01", help="Start date YYYY-MM-DD")
+    sync_parser.add_argument("--end", default=None, help="End date YYYY-MM-DD (default: today)")
+    sync_parser.add_argument("--cron", action="store_true", help="Print recommended crontab entries")
 
     return parser.parse_args()
 
@@ -914,7 +898,7 @@ async def initialize_base_tools(config: Config):
     return tools, skill_loader
 
 
-def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, session_id: str):
+def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, session_id: int):
     """Add workspace-dependent tools
 
     These tools need to know the workspace directory.
@@ -960,14 +944,9 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, 
         tools.extend(stock_tools)
         print(f"{Colors.GREEN}✅ Loaded {len(stock_tools)} A-share stock tools (skeleton){Colors.RESET}")
 
-    # Trade record tools - for recording buy/sell operations
-    # Check if enable_trade_tools exists (added in config.yaml) or default to True
-    enable_trade = getattr(config.tools, "enable_trade_tools", True)
-    if enable_trade:
-        memory_db = str(get_memory_db_path(workspace_dir))
-        trade_tools = create_trade_tools(memory_file=memory_db, session_id=session_id)
-        tools.extend(trade_tools)
-        print(f"{Colors.GREEN}✅ Loaded {len(trade_tools)} trade tools (SQLite){Colors.RESET}")
+    # NOTE:
+    # We intentionally keep a single simulation trading pipeline
+    # (sim_trades/sim_positions via SimulateTradeTool) to avoid dual trade ledgers.
 
 
 async def _quiet_cleanup():
@@ -997,7 +976,6 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # 1) 读配置 -> 2) 初始化 LLM -> 3) 装配工具 -> 4) 构建 Agent
     # 5) 进入非交互/交互模式 -> 6) 清理 MCP 连接
     session_start = datetime.now()
-    session_id = uuid4().hex
 
     # 1. Load configuration from package directory
     config_path = Config.get_default_config_path()
@@ -1083,10 +1061,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # 3. Initialize base tools (independent of workspace)
     tools, skill_loader = await initialize_base_tools(config)
 
-    # 4. Add workspace-dependent tools
-    add_workspace_tools(tools, config, workspace_dir, session_id=session_id)
-
-    # 5. Load System Prompt (with priority search)
+    # 4. Load System Prompt (with priority search)
     # 学习提示：System Prompt 是 Agent 的“长期行为约束”。
     system_prompt_path = Config.find_config_file(config.agent.system_prompt_path)
     if system_prompt_path and system_prompt_path.exists():
@@ -1096,7 +1071,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
         system_prompt = "You are Mini-Agent, an intelligent assistant powered by MiniMax M2.5 that can help users complete various tasks."
         print(f"{Colors.YELLOW}⚠️  System prompt not found, using default{Colors.RESET}")
 
-    # 6. Inject Skills Metadata into System Prompt (Progressive Disclosure - Level 1)
+    # 5. Inject Skills Metadata into System Prompt (Progressive Disclosure - Level 1)
     # 学习提示：这里只注入技能名称+描述，避免一次性把所有技能正文塞进上下文。
     if skill_loader:
         skills_metadata = skill_loader.get_skills_metadata_prompt()
@@ -1111,7 +1086,22 @@ async def run_agent(workspace_dir: Path, task: str = None):
         # Remove placeholder if skills not enabled
         system_prompt = system_prompt.replace("{SKILLS_METADATA}", "")
 
-    # 7. Create Agent
+    # 6. Create and start a runtime session (interactive CLI itself is one session).
+    session_manager = SessionManager(db_path=str(get_memory_db_path(workspace_dir)))
+    session_name = f"cli-{session_start.strftime('%Y%m%d-%H%M%S')}"
+    session_id = session_manager.create_session(
+        name=session_name,
+        system_prompt=system_prompt,
+        mode="simulation",
+        initial_capital=100000.0,
+    )
+    session_manager.start_session(session_id)
+    print(f"{Colors.GREEN}✅ Runtime session started: {session_id} ({session_name}){Colors.RESET}")
+
+    # 7. Add workspace-dependent tools
+    add_workspace_tools(tools, config, workspace_dir, session_id=session_id)
+
+    # 8. Create Agent
     agent = Agent(
         llm_client=llm_client,
         system_prompt=system_prompt,
@@ -1121,12 +1111,12 @@ async def run_agent(workspace_dir: Path, task: str = None):
         enable_intercept_log=config.agent.enable_intercept_log,
     )
 
-    # 8. Display welcome information
+    # 9. Display welcome information
     if not task:
         print_banner()
         print_session_info(agent, workspace_dir, config.llm.model)
 
-    # 8.5 Non-interactive mode: execute task and exit
+    # 9.5 Non-interactive mode: execute task and exit
     # 学习提示：--task 会直接跑一次 agent.run() 然后退出，不进入 REPL 循环。
     if task:
         print(f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Executing task...{Colors.RESET}\n")
@@ -1138,6 +1128,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
         finally:
             print_stats(agent, session_start)
 
+        session_manager.stop_session(session_id)
         # Cleanup MCP connections
         await _quiet_cleanup()
         return
@@ -1358,6 +1349,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
             print(f"\n{Colors.RED}❌ Error: {e}{Colors.RESET}")
             print(f"{Colors.DIM}{'─' * 60}{Colors.RESET}\n")
 
+    session_manager.stop_session(session_id)
     # 11. Cleanup MCP connections
     await _quiet_cleanup()
 
@@ -1378,6 +1370,36 @@ def handle_health_command(args: argparse.Namespace, workspace_dir: Path) -> None
         print(f"{Colors.BOLD}Checks:{Colors.RESET}")
         for check_name, check_result in result["checks"].items():
             print(f"  {check_name}: {check_result}")
+
+
+def handle_sync_command(args: argparse.Namespace, workspace_dir: Path) -> None:
+    """Sync A-share daily K-line data into unified DB."""
+    db_path = get_default_memory_db_path()
+    kline_db = KLineDB(db_path=str(db_path))
+
+    if args.cron:
+        print("Recommended crontab entries:")
+        for line in build_cron_lines(Path.cwd(), args.start):
+            print(line)
+        return
+
+    try:
+        tickers = resolve_ticker_universe(args.tickers or "", args.all)
+    except Exception as exc:
+        print(f"{Colors.RED}❌ Failed to fetch ticker universe: {exc}{Colors.RESET}")
+        return
+    if not tickers:
+        print(f"{Colors.RED}❌ Provide tickers (e.g. 600519,000001) or use --all{Colors.RESET}")
+        return
+
+    print(f"{Colors.CYAN}🔄 Syncing K-line data -> {db_path}{Colors.RESET}")
+    result = sync_kline_data(kline_db, tickers=tickers, start=args.start, end=args.end)
+    print(f"tickers={len(tickers)}, range={args.start}~{result.end_date}")
+
+    print(f"{Colors.GREEN}✅ Sync done{Colors.RESET}")
+    print(f"success={result.success_count}, failed={len(result.failed)}, rows={result.total_rows}")
+    if result.failed:
+        print(f"{Colors.YELLOW}failed tickers: {', '.join(result.failed[:20])}{Colors.RESET}")
 
 
 def main():
@@ -1440,6 +1462,10 @@ def main():
             print(f"{Colors.RED}❌ Missing health action. Use: check{Colors.RESET}")
             return
         handle_health_command(args, workspace_dir)
+        return
+
+    if args.command == "sync":
+        handle_sync_command(args, workspace_dir)
         return
 
     # Run the agent (config always loaded from package directory)
