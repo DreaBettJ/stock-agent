@@ -75,6 +75,7 @@ class Agent:
         workspace_dir: str = "./workspace",  # 工作目录,Agent 在此目录下操作文件
         token_limit: int = 80000,      # Token 限制,超过时触发摘要
         enable_intercept_log: bool = True,  # 是否启用日志记录
+        session_id: int | str | None = None,  # 用于日志分组的会话 ID
     ):
         """初始化 Agent 实例
 
@@ -128,7 +129,7 @@ class Agent:
         self.messages: list[Message] = [Message(role="system", content=system_prompt)]
 
         # 初始化日志记录器
-        self.logger = AgentLogger(enabled=enable_intercept_log)
+        self.logger = AgentLogger(enabled=enable_intercept_log, session_id=session_id)
 
         # ============================================================
         # Token 使用统计

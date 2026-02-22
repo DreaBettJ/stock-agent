@@ -310,6 +310,35 @@ def get_memory_db_path(workspace_dir: Path) -> Path:
     return get_default_memory_db_path()
 
 
+async def _persist_turn_memory(
+    tools: List[Tool],
+    *,
+    session_id: int,
+    category: str,
+    content: str,
+    importance: int = 1,
+) -> None:
+    """Persist one conversation turn into memories via record_memory tool."""
+    if not content.strip():
+        return
+
+    recorder = next((t for t in tools if getattr(t, "name", "") == "record_memory"), None)
+    if recorder is None:
+        return
+
+    try:
+        result = await recorder.execute(
+            content=content,
+            category=category,
+            importance=importance,
+            session_id=str(session_id),
+        )
+        if not result.success:
+            print(f"{Colors.YELLOW}⚠️ Memory persist failed: {result.error}{Colors.RESET}")
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"{Colors.YELLOW}⚠️ Memory persist exception: {exc}{Colors.RESET}")
+
+
 def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle session subcommands."""
     manager = SessionManager(db_path=str(get_memory_db_path(workspace_dir)))
@@ -1109,6 +1138,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
         max_steps=config.agent.max_steps,
         workspace_dir=str(workspace_dir),
         enable_intercept_log=config.agent.enable_intercept_log,
+        session_id=session_id,
     )
 
     # 9. Display welcome information
@@ -1120,9 +1150,16 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # 学习提示：--task 会直接跑一次 agent.run() 然后退出，不进入 REPL 循环。
     if task:
         print(f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Executing task...{Colors.RESET}\n")
+        await _persist_turn_memory(tools, session_id=session_id, category="conversation_user", content=task)
         agent.add_user_message(task)
         try:
-            await agent.run()
+            final_reply = await agent.run()
+            await _persist_turn_memory(
+                tools,
+                session_id=session_id,
+                category="conversation_assistant",
+                content=final_reply or "",
+            )
         except Exception as e:
             print(f"\n{Colors.RED}❌ Error: {e}{Colors.RESET}")
         finally:
@@ -1257,6 +1294,12 @@ async def run_agent(workspace_dir: Path, task: str = None):
             print(
                 f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Thinking... (Esc to cancel){Colors.RESET}\n"
             )
+            await _persist_turn_memory(
+                tools,
+                session_id=session_id,
+                category="conversation_user",
+                content=user_input,
+            )
             agent.add_user_message(user_input)
 
             # Create cancellation event
@@ -1328,7 +1371,13 @@ async def run_agent(workspace_dir: Path, task: str = None):
                     await asyncio.sleep(0.1)
 
                 # Get result
-                _ = agent_task.result()
+                final_reply = agent_task.result()
+                await _persist_turn_memory(
+                    tools,
+                    session_id=session_id,
+                    category="conversation_assistant",
+                    content=final_reply or "",
+                )
 
             except asyncio.CancelledError:
                 print(f"\n{Colors.BRIGHT_YELLOW}⚠️  Agent execution cancelled{Colors.RESET}")

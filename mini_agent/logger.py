@@ -16,7 +16,7 @@ class AgentLogger:
     - Tool calls and results
     """
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, session_id: int | str | None = None):
         """Initialize logger
 
         Logs are stored in <project_root>/log/ directory
@@ -29,6 +29,11 @@ class AgentLogger:
         self.log_file = None
         self.intercept_log_file = None
         self.log_index = 0
+        self.session_id: str | None = str(session_id) if session_id is not None else None
+
+    def set_session_id(self, session_id: int | str | None) -> None:
+        """Bind logger output to one session id."""
+        self.session_id = str(session_id) if session_id is not None else None
 
     def start_new_run(self):
         """Start new run, create new log file"""
@@ -36,8 +41,11 @@ class AgentLogger:
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = f"agent_run_{timestamp}.log"
-        intercept_filename = f"agent_intercept_{timestamp}.jsonl"
+        sid = self.session_id or "unknown"
+        # Keep file names simple and filesystem-safe.
+        sid = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in sid)
+        log_filename = f"agent_run_s{sid}_{timestamp}.log"
+        intercept_filename = f"agent_intercept_s{sid}_{timestamp}.jsonl"
         self.log_file = self.log_dir / log_filename
         self.intercept_log_file = self.log_dir / intercept_filename
         self.log_index = 0
@@ -46,6 +54,7 @@ class AgentLogger:
         with open(self.log_file, "w", encoding="utf-8") as f:
             f.write("=" * 80 + "\n")
             f.write(f"Agent Run Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Session ID: {self.session_id or 'unknown'}\n")
             f.write("=" * 80 + "\n\n")
 
     def log_intercept_event(self, event: str, data: dict[str, Any]):
