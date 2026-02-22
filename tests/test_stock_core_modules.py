@@ -143,3 +143,8 @@ async def test_event_broadcaster_filters_sessions(tmp_path: Path):
     assert called == [sid_a]
     assert results[0]["success"] is True
     assert results[0]["event_type"] == "daily_review"
+
+    logs = manager.list_event_logs(session_id=sid_a, limit=10)
+    assert len(logs) == 1
+    assert logs[0]["event_type"] == "daily_review"
+    assert logs[0]["success"] is True

@@ -85,7 +85,7 @@ mini-agent sync --cron
 ```bash
 mini-agent event trigger daily_review --session 1
 mini-agent event trigger daily_review --all
-mini-agent event trigger daily_review --session 1 --auto
+mini-agent event trigger daily_review --session 1
 ```
 
 ### 5.6 模拟交易
@@ -115,7 +115,7 @@ mini-agent backtest result --session 1
 - `trade`
   - 直接对 session 资金与仓位做买卖落库。
 - `event`
-  - 广播或单点触发；`--auto` 会启用 LLM 决策与下单。
+  - 广播或单点触发；默认会启用 LLM 决策与模拟下单。
 - `sync`
   - 将 A 股日线写入 `daily_kline`，供 `trade/backtest/event` 共用。
 

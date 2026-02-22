@@ -669,46 +669,47 @@ def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
         print(f"{Colors.YELLOW}⚠️ No listening sessions matched this event.{Colors.RESET}")
         return
 
-    if args.auto:
-        print(f"{Colors.CYAN}🤖 Auto trading mode{Colors.RESET}")
-        try:
-            runtime = build_decision_runtime(workspace_dir, get_memory_db_path(workspace_dir))
-        except FileNotFoundError as exc:
-            print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
-            return
-
-        trading_date = str(event.get("date") or datetime.now().date().isoformat())
-        session_ids = [session.session_id for session in target_sessions]
-        auto_records = asyncio.run(_run_auto_event_for_sessions(runtime, session_ids, trading_date))
-        for item in auto_records:
-            sid = item["session_id"]
-            if not item.get("success"):
-                print(f"- {sid}: failed {item.get('error', 'unknown error')}")
-                continue
-
-            result = item["result"]
-            signal = result.get("trade_signal")
-            if signal:
-                summary = f"{signal['action']} {signal['ticker']} x{signal['quantity']}"
-            else:
-                summary = "no_trade"
-
-            execution = result.get("execution")
-            execution_error = result.get("execution_error")
-            detail = execution if execution else execution_error if execution_error else summary
-            print(f"- {sid}: ok {summary} | {detail}")
+    print(f"{Colors.CYAN}🤖 Auto trading mode (default){Colors.RESET}")
+    try:
+        runtime = build_decision_runtime(workspace_dir, get_memory_db_path(workspace_dir))
+    except FileNotFoundError as exc:
+        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
         return
 
-    broadcaster = EventBroadcaster(session_manager=manager, trigger=_default_event_trigger)
-    if args.all_sessions:
-        results = asyncio.run(broadcaster.broadcast(event))
-    else:
-        results = [asyncio.run(broadcaster.trigger_session(target_sessions[0], event))]
-    for item in results:
+    trading_date = str(event.get("date") or datetime.now().date().isoformat())
+    session_ids = [session.session_id for session in target_sessions]
+    auto_records = asyncio.run(_run_auto_event_for_sessions(runtime, session_ids, trading_date))
+    for item in auto_records:
         sid = item["session_id"]
-        status = "ok" if item.get("success") else "failed"
-        detail = item.get("result") or item.get("error", "")
-        print(f"- {sid}: {status} {detail}")
+        if not item.get("success"):
+            error_message = item.get("error", "unknown error")
+            manager.record_event_result(
+                session_id=sid,
+                event=event,
+                success=False,
+                error=error_message,
+            )
+            print(f"- {sid}: failed {error_message}")
+            continue
+
+        result = item["result"]
+        signal = result.get("trade_signal")
+        if signal:
+            summary = f"{signal['action']} {signal['ticker']} x{signal['quantity']}"
+        else:
+            summary = "no_trade"
+
+        execution = result.get("execution")
+        execution_error = result.get("execution_error")
+        detail = execution if execution else execution_error if execution_error else summary
+        manager.record_event_result(
+            session_id=sid,
+            event=event,
+            success=execution_error is None,
+            result=detail,
+            error=execution_error,
+        )
+        print(f"- {sid}: ok {summary} | {detail}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -859,7 +860,6 @@ Examples:
 
     event_trigger = event_subparsers.add_parser("trigger", help="Trigger one event")
     event_trigger.add_argument("event_type", help="Event type, e.g. daily_review")
-    event_trigger.add_argument("--auto", action="store_true", help="Auto trading: trigger agent analysis + execute trade")
     target_group = event_trigger.add_mutually_exclusive_group(required=True)
     target_group.add_argument("--all", action="store_true", dest="all_sessions", help="Trigger all listening sessions")
     target_group.add_argument("--session", dest="session_id", type=int, help="Trigger a specific session")

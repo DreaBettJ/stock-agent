@@ -55,6 +55,7 @@ class SessionManager:
             elif self._needs_session_id_migration(conn):
                 self._migrate_sessions_table(conn)
 
+            self._create_event_logs_table(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_mode ON sessions(mode)")
             conn.commit()
@@ -90,6 +91,27 @@ class SessionManager:
             )
             """
         )
+
+    @staticmethod
+    def _create_event_logs_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                event_type TEXT,
+                event_payload TEXT,
+                success INTEGER NOT NULL,
+                result TEXT,
+                error TEXT,
+                triggered_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_logs_session ON event_logs(session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_logs_type ON event_logs(event_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_logs_created_at ON event_logs(created_at)")
 
     @staticmethod
     def _needs_session_id_migration(conn: sqlite3.Connection) -> bool:
@@ -347,6 +369,7 @@ class SessionManager:
             self._delete_if_table_exists(conn, "sim_trades", sid)
             self._delete_if_table_exists(conn, "trades", sid)
             self._delete_if_table_exists(conn, "notes", sid)
+            self._delete_if_table_exists(conn, "event_logs", sid)
             cursor = conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
             conn.commit()
         if cursor.rowcount == 0:
@@ -356,6 +379,85 @@ class SessionManager:
         """Return listening sessions that should receive event."""
         event_type = str(event.get("type") or "").strip() or None
         return self.get_listening_sessions(event_type)
+
+    def record_event_result(
+        self,
+        session_id: int | str,
+        event: dict[str, Any],
+        *,
+        success: bool,
+        result: str | None = None,
+        error: str | None = None,
+    ) -> int:
+        """Persist one event handling record."""
+        sid = self._normalize_session_id(session_id)
+        event_type = str(event.get("type") or "")
+        triggered_at = str(event.get("triggered_at") or datetime.now().isoformat())
+        payload = json.dumps(event, ensure_ascii=False)
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO event_logs (
+                    session_id, event_type, event_payload,
+                    success, result, error, triggered_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sid,
+                    event_type,
+                    payload,
+                    1 if success else 0,
+                    result,
+                    error,
+                    triggered_at,
+                    datetime.now().isoformat(),
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def list_event_logs(self, session_id: int | str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """List recent event logs, optionally filtered by session_id."""
+        if limit <= 0:
+            return []
+
+        with self._connect() as conn:
+            if session_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT id, session_id, event_type, event_payload, success, result, error, triggered_at, created_at
+                    FROM event_logs
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            else:
+                sid = self._normalize_session_id(session_id)
+                rows = conn.execute(
+                    """
+                    SELECT id, session_id, event_type, event_payload, success, result, error, triggered_at, created_at
+                    FROM event_logs
+                    WHERE session_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (sid, limit),
+                ).fetchall()
+
+        logs: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            payload_raw = item.get("event_payload")
+            if isinstance(payload_raw, str) and payload_raw:
+                try:
+                    item["event_payload"] = json.loads(payload_raw)
+                except json.JSONDecodeError:
+                    pass
+            item["success"] = bool(item.get("success"))
+            logs.append(item)
+        return logs
 
     @staticmethod
     def _delete_if_table_exists(conn: sqlite3.Connection, table_name: str, session_id: int) -> None:

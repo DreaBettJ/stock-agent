@@ -90,7 +90,7 @@ event_filter: list[str]
   - 广播给所有 listening session。
 - `mini-agent event trigger <event_type> --session <id>`
   - 只触发单 session。
-- `--auto` 模式：直接走 LLM 决策并尝试执行模拟交易。
+- 事件触发默认走 LLM 决策并尝试执行模拟交易。
 
 ### 4.3 模拟交易（trade）
 
@@ -137,7 +137,7 @@ mini-agent backtest result --session <id>
 # Event
 mini-agent event trigger daily_review --session <id>
 mini-agent event trigger daily_review --all
-mini-agent event trigger daily_review --session <id> --auto
+mini-agent event trigger daily_review --session <id>
 
 # Sync
 mini-agent sync 600519,000001 --start 2020-01-01

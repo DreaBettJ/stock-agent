@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime
 from typing import Any
 
 from .agent import Agent
 from .config import Config
-from .event_broadcaster import EventBroadcaster
 from .llm import LLMClient
 from .schema import LLMProvider
 from .session import SessionManager
@@ -20,6 +18,11 @@ logger = logging.getLogger(__name__)
 
 class AutoTradingWorkflow:
     """Auto trading workflow: event -> agent analysis -> execute trade."""
+    # 该工作流负责把“每日事件”转为“可执行交易动作”：
+    # 1) 读取会话与行情/持仓上下文
+    # 2) 组织 prompt 交给 LLM 分析
+    # 3) 解析结构化买卖信号
+    # 4) 可选调用交易执行器落库
 
     def __init__(
         self,
@@ -55,18 +58,17 @@ class AutoTradingWorkflow:
         trade_executor: Any | None = None,
     ) -> dict[str, Any]:
         """Trigger daily review for a session and optionally auto-execute trade."""
-        
-        # 1. Get session
+        # 1) 读取 session（策略文本、模式、资金状态等）。
         session = self.session_manager.get_session(session_id)
-        
-        # 2. Prepare market data
+
+        # 2) 准备当日市场上下文（如涨幅榜）。
         trading_date = trading_date or datetime.now().strftime("%Y-%m-%d")
         market_data = self._prepare_market_data(trading_date)
-        
-        # 3. Prepare positions
+
+        # 3) 准备该会话当前持仓（含估值与近端 K 线片段）。
         positions = self._get_positions(session_id, as_of_date=trading_date)
-        
-        # 4. Build prompt with strategy
+
+        # 4) 组装“事件 + 持仓 + 市场 + 策略”综合 prompt。
         prompt = self._build_review_prompt(
             session=session,
             market_data=market_data,
@@ -82,7 +84,7 @@ class AutoTradingWorkflow:
         )
         logger.info("Prompt to LLM (session=%s, date=%s):\n%s", session_id, trading_date, prompt)
         
-        # 5. Call Agent for analysis
+        # 5) 创建仅分析模式的 Agent（tools=[]），避免在分析阶段直接调用工具。
         llm = LLMClient(
             provider=LLMProvider(self.llm_provider),
             model=self.model,
@@ -97,14 +99,14 @@ class AutoTradingWorkflow:
             session_id=session_id,
         )
         
-        # Add user message with context
+        # 把构造好的上下文作为用户输入交给 Agent。
         agent.add_user_message(prompt)
-        
-        # Run agent
+
+        # 执行一次完整推理，得到自然语言分析文本。
         result = await agent.run()
         logger.info("LLM analysis completed (session=%s, date=%s): %s", session_id, trading_date, result)
-        
-        # 6. Parse agent response for trade signal
+
+        # 6) 解析买卖信号；若开启 auto_execute 则调用外部执行器实际下单。
         trade_signal = self._parse_trade_signal(result, session)
         execution = None
         if auto_execute and trade_signal and trade_executor is not None:
@@ -134,13 +136,13 @@ class AutoTradingWorkflow:
 
     def _prepare_market_data(self, date: str) -> dict[str, Any]:
         """Prepare market data for the day."""
-        # Get top gainers
+        # 容错处理：行情读取失败时返回空榜单，不中断整个决策链路。
         try:
             top_gainers = self._get_top_gainers(date)
         except Exception:
             top_gainers = []
         
-        # Get market summary
+        # 当前仅使用涨幅榜作为市场快照，可在此处继续扩展更多指标。
         market_summary = {
             "date": date,
             "top_gainers": top_gainers[:10],
@@ -186,11 +188,12 @@ class AutoTradingWorkflow:
                     (session_id,),
                 ).fetchall()
             except sqlite3.OperationalError:
+                # 首次运行、无成交记录时，sim_positions 表可能尚未创建。
                 return []
 
         positions = []
         for r in rows:
-            # Get current price
+            # 估值口径：若指定 as_of_date 则按“该日及之前”价格，避免前视偏差。
             try:
                 if as_of_date:
                     current_price = self.kline_db.get_price_on_or_before(r["ticker"], as_of_date)
@@ -202,7 +205,7 @@ class AutoTradingWorkflow:
             profit = (current_price - r["avg_cost"]) * r["quantity"]
             profit_rate = (current_price - r["avg_cost"]) / r["avg_cost"] * 100
             
-            # Get kline data (last 20 days)
+            # 取近窗 K 线供策略判断（趋势、均线等），默认截断到最近 20 根。
             from datetime import datetime, timedelta
             if as_of_date:
                 end_date = as_of_date
@@ -297,6 +300,10 @@ class AutoTradingWorkflow:
 
     def _parse_trade_signal(self, agent_response: str, session) -> dict[str, Any] | None:
         """Parse trade signal from agent response."""
+        # 当前解析规则是“轻量文本协议”：
+        # - 不操作/无操作/观望 => None
+        # - 买入:代码,数量 或 卖出:代码,数量 => 结构化信号
+        # 后续可升级为 JSON schema 输出以提升鲁棒性。
         response = agent_response.strip()
         
         # Check for "no operation" signal
