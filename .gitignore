@@ -64,3 +64,5 @@ CLAUDE.md
 # SQLite databases
 .agent_memory.db
 .agent_memory.db-*
+
+/log/*
