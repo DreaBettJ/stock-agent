@@ -66,12 +66,52 @@ class ToolsConfig(BaseModel):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
 
 
+class SmtpNoticeConfig(BaseModel):
+    """SMTP notice channel configuration."""
+
+    enabled: bool = False
+    host: str = ""
+    port: int = 465
+    username: str = ""
+    password: str = ""
+    use_ssl: bool = True
+    use_starttls: bool = False
+    from_addr: str = ""
+    to_addrs: list[str] = Field(default_factory=list)
+    subject_prefix: str = "[Big-A-Helper]"
+    timeout_seconds: float = 10.0
+
+
+class NoticeConfig(BaseModel):
+    """Notice channels configuration."""
+
+    smtp: SmtpNoticeConfig = Field(default_factory=SmtpNoticeConfig)
+
+
+class NoticeLevelConfig(BaseModel):
+    """Notice severity switches."""
+
+    p0_trade_realtime: bool = True
+    p1_risk_realtime: bool = False
+    p2_digest: bool = False
+
+
+class NoticeRiskConfig(BaseModel):
+    """Risk notice trigger thresholds."""
+
+    no_trade_with_veto: bool = True
+    consecutive_failures_threshold: int = 3
+
+
 class Config(BaseModel):
     """Main configuration class"""
 
     llm: LLMConfig
     agent: AgentConfig
     tools: ToolsConfig
+    notice: NoticeConfig = Field(default_factory=NoticeConfig)
+    notice_levels: NoticeLevelConfig = Field(default_factory=NoticeLevelConfig)
+    notice_risk: NoticeRiskConfig = Field(default_factory=NoticeRiskConfig)
 
     @classmethod
     def load(cls) -> "Config":
@@ -165,10 +205,42 @@ class Config(BaseModel):
             mcp=mcp_config,
         )
 
+        # Parse notice configuration
+        notice_data = data.get("notice", {}) or {}
+        smtp_data = notice_data.get("smtp", {}) or {}
+        smtp_config = SmtpNoticeConfig(
+            enabled=bool(smtp_data.get("enabled", False)),
+            host=str(smtp_data.get("host", "") or ""),
+            port=int(smtp_data.get("port", 465) or 465),
+            username=str(smtp_data.get("username", "") or ""),
+            password=str(smtp_data.get("password", "") or ""),
+            use_ssl=bool(smtp_data.get("use_ssl", True)),
+            use_starttls=bool(smtp_data.get("use_starttls", False)),
+            from_addr=str(smtp_data.get("from_addr", "") or ""),
+            to_addrs=[str(x).strip() for x in (smtp_data.get("to_addrs", []) or []) if str(x).strip()],
+            subject_prefix=str(smtp_data.get("subject_prefix", "[Big-A-Helper]") or "[Big-A-Helper]"),
+            timeout_seconds=float(smtp_data.get("timeout_seconds", 10.0) or 10.0),
+        )
+        notice_config = NoticeConfig(smtp=smtp_config)
+        levels_data = notice_data.get("levels", {}) or {}
+        notice_levels = NoticeLevelConfig(
+            p0_trade_realtime=bool(levels_data.get("p0_trade_realtime", True)),
+            p1_risk_realtime=bool(levels_data.get("p1_risk_realtime", False)),
+            p2_digest=bool(levels_data.get("p2_digest", False)),
+        )
+        risk_data = notice_data.get("risk", {}) or {}
+        notice_risk = NoticeRiskConfig(
+            no_trade_with_veto=bool(risk_data.get("no_trade_with_veto", True)),
+            consecutive_failures_threshold=int(risk_data.get("consecutive_failures_threshold", 3) or 3),
+        )
+
         return cls(
             llm=llm_config,
             agent=agent_config,
             tools=tools_config,
+            notice=notice_config,
+            notice_levels=notice_levels,
+            notice_risk=notice_risk,
         )
 
     @staticmethod

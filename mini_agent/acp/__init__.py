@@ -1,4 +1,4 @@
-"""ACP (Agent Client Protocol) bridge for Mini-Agent."""
+"""ACP (Agent Client Protocol) bridge for Big A Helper."""
 
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ class MiniMaxACPAgent:
         return InitializeResponse(
             protocolVersion=PROTOCOL_VERSION,
             agentCapabilities=AgentCapabilities(loadSession=False),
-            agentInfo=Implementation(name="mini-agent", title="Mini-Agent", version="0.1.0"),
+            agentInfo=Implementation(name="big-a-helper", title="Big-A-Helper", version="0.1.0"),
         )
 
     async def newSession(self, params: NewSessionRequest) -> NewSessionResponse:
@@ -98,7 +98,7 @@ class MiniMaxACPAgent:
         if not workspace.is_absolute():
             workspace = workspace.resolve()
         tools = list(self._base_tools)
-        add_workspace_tools(tools, self._config, workspace)
+        add_workspace_tools(tools, self._config, workspace, session_id=0)
         agent = Agent(
             llm_client=self._llm,
             system_prompt=self._system_prompt,
@@ -113,13 +113,8 @@ class MiniMaxACPAgent:
     async def prompt(self, params: PromptRequest) -> PromptResponse:
         state = self._sessions.get(params.sessionId)
         if not state:
-            # Auto-create session if not found (compatibility with clients that skip newSession)
-            logger.warning(f"Session '{params.sessionId}' not found, auto-creating new session")
-            new_session = await self.newSession(NewSessionRequest(cwd=None))
-            state = self._sessions.get(new_session.sessionId)
-            if not state:
-                logger.error("Failed to auto-create session")
-                return PromptResponse(stopReason="refusal")
+            logger.warning("Session '%s' not found", params.sessionId)
+            return PromptResponse(stopReason="refusal")
         state.cancelled = False
         user_text = "\n".join(block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "") for block in params.prompt)
         state.agent.messages.append(Message(role="user", content=user_text))
@@ -176,7 +171,7 @@ class MiniMaxACPAgent:
 
 
 async def run_acp_server(config: Config | None = None) -> None:
-    """Run Mini-Agent as an ACP-compatible stdio server."""
+    """Run Big-A-Helper as an ACP-compatible stdio server."""
     config = config or Config.load()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     base_tools, skill_loader = await initialize_base_tools(config)
@@ -193,7 +188,7 @@ async def run_acp_server(config: Config | None = None) -> None:
     llm = LLMClient(api_key=config.llm.api_key, api_base=config.llm.api_base, model=config.llm.model, retry_config=RetryConfigBase(enabled=rcfg.enabled, max_retries=rcfg.max_retries, initial_delay=rcfg.initial_delay, max_delay=rcfg.max_delay, exponential_base=rcfg.exponential_base))
     reader, writer = await stdio_streams()
     AgentSideConnection(lambda conn: MiniMaxACPAgent(conn, config, llm, base_tools, system_prompt), writer, reader)
-    logger.info("Mini-Agent ACP server running")
+    logger.info("Big-A-Helper ACP server running")
     await asyncio.Event().wait()
 
 

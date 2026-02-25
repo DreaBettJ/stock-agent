@@ -51,7 +51,7 @@ def build_runtime_session_context(
     pid: int | None = None,
     session_name_prefix: str = "runtime",
     session_name: str | None = None,
-    mode: str = "simulation",
+    mode: str | None = "simulation",
     initial_capital: float = 100000.0,
     create_session_kwargs: dict[str, Any] | None = None,
 ) -> RuntimeSessionContext:

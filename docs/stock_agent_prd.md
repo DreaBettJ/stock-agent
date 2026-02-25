@@ -1,4 +1,4 @@
-# Mini-Agent 股票助手 PRD（极简统一版）
+# Big-A-Helper 股票助手 PRD（极简统一版）
 
 ## 1. 产品目标
 
@@ -102,19 +102,19 @@ event_filter: list[str]
 
 ### 4.1 对话模式（start）
 
-1. 启动 `mini-agent`。
+1. 启动 `big-a-helper`。
 2. 自动创建并 `start` 一个 runtime session（命名 `cli-YYYYmmdd-HHMMSS`）。
 3. 对话期间工具调用和记忆写入都绑定该 session。
 4. 退出时自动 `stop` 该 session。
 
 ### 4.2 事件触发（event）
 
-- `mini-agent event trigger <event_type> --all`
+- `big-a-helper event trigger <event_type> --all`
   - 广播给所有 listening session。
-- `mini-agent event trigger <event_type> --session <id>`
+- `big-a-helper event trigger <event_type> --session <id>`
   - 只触发单 session。
 - 事件触发默认走 LLM 决策并尝试执行模拟交易。
-- `mini-agent event trigger <event_type> --session <id> --debug`
+- `big-a-helper event trigger <event_type> --session <id> --debug`
   - 调试模式：自动为事件生成唯一 `event_id`，跳过重复事件幂等拦截（用于重放/排查）。
 
 ### 4.3 模拟交易（trade）
@@ -147,7 +147,7 @@ event_filter: list[str]
    - 输出：`evolution_use_cases`（`enabled=1`）。
 
 2. `inject` 阶段（运行时注入）
-   - 启动 `mini-agent` 时加载启用的 use case，拼接到系统提示词。
+   - 启动 `big-a-helper` 时加载启用的 use case，拼接到系统提示词。
    - 目标是让 Agent 直接吸收经验规律，减少重复犯错。
 
 3. `manage` 阶段（轻量治理）
@@ -160,40 +160,40 @@ event_filter: list[str]
 
 ```bash
 # Session
-mini-agent session create --name "demo" --prompt "..." [--mode simulation|backtest] [--initial-capital 100000]
-mini-agent session list
-mini-agent session start <id>
-mini-agent session stop <id>
-mini-agent session delete <id>
+big-a-helper session create --name "demo" --prompt "..." [--mode simulation|backtest] [--initial-capital 100000]
+big-a-helper session list
+big-a-helper session start <id>
+big-a-helper session stop <id>
+big-a-helper session delete <id>
 
 # Trade
-mini-agent trade buy 600519 100 --session <id> [--date YYYY-MM-DD]
-mini-agent trade sell 600519 100 --session <id> [--date YYYY-MM-DD]
-mini-agent trade positions --session <id>
-mini-agent trade profit --session <id>
+big-a-helper trade buy 600519 100 --session <id> [--date YYYY-MM-DD]
+big-a-helper trade sell 600519 100 --session <id> [--date YYYY-MM-DD]
+big-a-helper trade positions --session <id>
+big-a-helper trade profit --session <id>
 
 # Backtest
-mini-agent backtest run --session <id> --start 2024-01-01 --end 2024-12-31
-mini-agent backtest result --session <id>
+big-a-helper backtest run --session <id> --start 2024-01-01 --end 2024-12-31
+big-a-helper backtest result --session <id>
 
 # Event
-mini-agent event trigger daily_review --session <id>
-mini-agent event trigger daily_review --all
-mini-agent event trigger daily_review --session <id> --debug   # 调试重放，跳过重复事件拦截
+big-a-helper event trigger daily_review --session <id>
+big-a-helper event trigger daily_review --all
+big-a-helper event trigger daily_review --session <id> --debug   # 调试重放，跳过重复事件拦截
 
 # Sync
-mini-agent sync 600519,000001 --start 2020-01-01
-mini-agent sync --all                      # 默认当日增量
-mini-agent sync --all --start 2026-02-24 --end 2026-02-24
-mini-agent sync --cron
+big-a-helper sync 600519,000001 --start 2020-01-01
+big-a-helper sync --all                      # 默认当日增量
+big-a-helper sync --all --start 2026-02-24 --end 2026-02-24
+big-a-helper sync --cron
 
 # Evolve (EVO-HIL)
-mini-agent evolve scan --limit 200              # 默认 LLM 生成提案
-mini-agent evolve scan --no-llm --limit 200     # 规则模板兜底
-mini-agent evolve list --enabled on
-mini-agent evolve enable <use_case_id>
-mini-agent evolve disable <use_case_id>
-mini-agent evolve prompt --limit 12
+big-a-helper evolve scan --limit 200              # 默认 LLM 生成提案
+big-a-helper evolve scan --no-llm --limit 200     # 规则模板兜底
+big-a-helper evolve list --enabled on
+big-a-helper evolve enable <use_case_id>
+big-a-helper evolve disable <use_case_id>
+big-a-helper evolve prompt --limit 12
 ```
 
 ---

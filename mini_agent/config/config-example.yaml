@@ -1,4 +1,4 @@
-# Mini Agent Configuration Example
+# Big A Helper Configuration Example
 # 
 # Configuration File Locations (in priority order):
 # 1) mini_agent/config/config.yaml - Development mode (current directory)
@@ -62,3 +62,28 @@ tools:
     connect_timeout: 10.0    # Connection timeout in seconds (default: 10)
     execute_timeout: 60.0    # Tool execution timeout in seconds (default: 60)
     sse_read_timeout: 120.0  # SSE read timeout in seconds (default: 120)
+
+# ===== Notice Configuration =====
+# Session-level switch: `trade_notice_enabled` controls whether a given session emits notices.
+# Channel-level switch below controls whether SMTP delivery is enabled globally.
+notice:
+  levels:
+    p0_trade_realtime: true
+    p1_risk_realtime: false
+    p2_digest: false
+  risk:
+    no_trade_with_veto: true
+    consecutive_failures_threshold: 3
+  smtp:
+    enabled: false
+    host: "smtp.example.com"
+    port: 465
+    username: "bot@example.com"
+    password: "YOUR_SMTP_PASSWORD"
+    use_ssl: true
+    use_starttls: false
+    from_addr: "bot@example.com"
+    to_addrs:
+      - "you@example.com"
+    subject_prefix: "[Big-A-Helper]"
+    timeout_seconds: 10.0

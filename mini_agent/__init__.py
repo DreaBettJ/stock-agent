@@ -1,4 +1,4 @@
-"""Mini Agent - Minimal single agent with basic tools and MCP support."""
+"""Big A Helper - A-share focused agent with tools and MCP support."""
 
 from .agent import Agent
 from .event_broadcaster import EventBroadcaster

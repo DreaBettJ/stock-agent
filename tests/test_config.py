@@ -13,7 +13,11 @@ from mini_agent.config import (
     Config,
     LLMConfig,
     MCPConfig,
+    NoticeConfig,
+    NoticeLevelConfig,
+    NoticeRiskConfig,
     RetryConfig,
+    SmtpNoticeConfig,
     ToolsConfig,
 )
 
@@ -148,6 +152,41 @@ class TestToolsConfig:
         assert config.mcp.connect_timeout == 5.0
 
 
+class TestNoticeConfig:
+    """Test NoticeConfig."""
+
+    def test_default_values(self):
+        cfg = NoticeConfig()
+        assert cfg.smtp.enabled is False
+        assert cfg.smtp.port == 465
+        assert cfg.smtp.use_ssl is True
+
+    def test_level_and_risk_defaults(self):
+        levels = NoticeLevelConfig()
+        risk = NoticeRiskConfig()
+        assert levels.p0_trade_realtime is True
+        assert levels.p1_risk_realtime is False
+        assert levels.p2_digest is False
+        assert risk.no_trade_with_veto is True
+        assert risk.consecutive_failures_threshold == 3
+
+    def test_custom_values(self):
+        cfg = SmtpNoticeConfig(
+            enabled=True,
+            host="smtp.example.com",
+            port=587,
+            username="u",
+            password="p",
+            use_ssl=False,
+            use_starttls=True,
+            from_addr="a@example.com",
+            to_addrs=["b@example.com"],
+        )
+        assert cfg.enabled is True
+        assert cfg.host == "smtp.example.com"
+        assert cfg.use_starttls is True
+
+
 class TestConfig:
     """Test main Config class."""
 
@@ -194,6 +233,42 @@ class TestConfig:
             path = Path(f.name)
         loaded = Config.from_yaml(path)
         assert loaded.tools.tushare_token == "ts-token-cfg"
+
+    def test_load_notice_smtp(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            config = {
+                "api_key": "test-api-key-12345",
+                "notice": {
+                    "levels": {
+                        "p0_trade_realtime": True,
+                        "p1_risk_realtime": True,
+                        "p2_digest": False,
+                    },
+                    "risk": {
+                        "no_trade_with_veto": True,
+                        "consecutive_failures_threshold": 2,
+                    },
+                    "smtp": {
+                        "enabled": True,
+                        "host": "smtp.example.com",
+                        "port": 587,
+                        "username": "u",
+                        "password": "p",
+                        "use_ssl": False,
+                        "use_starttls": True,
+                        "from_addr": "a@example.com",
+                        "to_addrs": ["b@example.com"],
+                    }
+                },
+            }
+            yaml.dump(config, f)
+            path = Path(f.name)
+        loaded = Config.from_yaml(path)
+        assert loaded.notice.smtp.enabled is True
+        assert loaded.notice.smtp.host == "smtp.example.com"
+        assert loaded.notice.smtp.port == 587
+        assert loaded.notice_levels.p1_risk_realtime is True
+        assert loaded.notice_risk.consecutive_failures_threshold == 2
 
     def test_load_missing_api_key(self, invalid_config_file):
         """Test that missing api_key raises error."""

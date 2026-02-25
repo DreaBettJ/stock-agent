@@ -313,6 +313,11 @@ def test_session_update_risk_profile(tmp_path: Path):
     assert session.stop_loss_pct == pytest.approx(5.5)
     assert session.take_profit_pct == pytest.approx(12.0)
     assert session.investment_horizon == "短线"
+    assert session.trade_notice_enabled is False
+
+    manager.update_risk_profile(sid, trade_notice_enabled=True)
+    session2 = manager.get_session(sid)
+    assert session2.trade_notice_enabled is True
 
 
 def test_trade_action_logs_roundtrip(tmp_path: Path):

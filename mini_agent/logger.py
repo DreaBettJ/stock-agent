@@ -55,14 +55,21 @@ class AgentLogger:
         self.log_file = self.log_dir / log_filename
         self.intercept_log_file = self.log_dir / intercept_filename
         self.log_index = 0
+        created = not self.log_file.exists()
 
-        # Write log header
-        with open(self.log_file, "w", encoding="utf-8") as f:
-            f.write("=" * 80 + "\n")
-            f.write(f"Agent Run Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Session ID: {self.session_id or 'unknown'}\n")
-            f.write("=" * 80 + "\n\n")
-        return True
+        # Append mode: keep full session history across attach/restart.
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            if created:
+                f.write("=" * 80 + "\n")
+                f.write(f"Agent Run Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Session ID: {self.session_id or 'unknown'}\n")
+                f.write("=" * 80 + "\n\n")
+            else:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(f"Agent Run Reattached - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Session ID: {self.session_id or 'unknown'}\n")
+                f.write("=" * 80 + "\n\n")
+        return created
 
     def log_run_start(self, run_index: int, message_count: int):
         """Write a visible boundary marker for each agent.run() invocation."""

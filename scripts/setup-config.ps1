@@ -1,5 +1,5 @@
-# Mini Agent Configuration Setup Script for Windows
-# This script helps you set up Mini Agent configuration files
+# Big-A-Helper Configuration Setup Script for Windows
+# This script helps you set up Big-A-Helper configuration files
 
 # Error handling
 $ErrorActionPreference = "Stop"
@@ -24,10 +24,10 @@ function Write-ColorOutput {
 }
 
 # Configuration directory
-$CONFIG_DIR = Join-Path $env:USERPROFILE ".mini-agent\config"
+$CONFIG_DIR = Join-Path $env:USERPROFILE ".big-a-helper\config"
 
 Write-ColorOutput "==================================================" -Color "Cyan"
-Write-ColorOutput "   Mini Agent Configuration Setup" -Color "Cyan"
+Write-ColorOutput "   Big-A-Helper Configuration Setup" -Color "Cyan"
 Write-ColorOutput "==================================================" -Color "Cyan"
 Write-Host ""
 
@@ -37,7 +37,7 @@ Write-ColorOutput "[1/2] Creating configuration directory..." -Color "Blue"
 if (Test-Path $CONFIG_DIR) {
     # Auto backup existing config
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $BACKUP_DIR = Join-Path $env:USERPROFILE ".mini-agent\config.backup.$timestamp"
+    $BACKUP_DIR = Join-Path $env:USERPROFILE ".big-a-helper\config.backup.$timestamp"
     Write-ColorOutput "   Configuration directory exists, backing up to:" -Color "Yellow"
     Write-ColorOutput "   $BACKUP_DIR" -Color "Yellow"
     Copy-Item -Path $CONFIG_DIR -Destination $BACKUP_DIR -Recurse
@@ -109,7 +109,7 @@ Get-ChildItem $CONFIG_DIR -ErrorAction SilentlyContinue | ForEach-Object {
 Write-Host ""
 Write-ColorOutput "Next Steps:" -Color "Yellow"
 Write-Host ""
-Write-ColorOutput "1. Install Mini Agent:" -Color "Yellow"
+Write-ColorOutput "1. Install Big-A-Helper:" -Color "Yellow"
 Write-ColorOutput "   pipx install git+https://github.com/MiniMax-AI/Mini-Agent.git" -Color "Green"
 Write-Host ""
 Write-ColorOutput "2. Configure your API Key:" -Color "Yellow"
@@ -117,8 +117,8 @@ Write-Host "   Edit config.yaml and add your MiniMax API Key:"
 Write-ColorOutput "   notepad $CONFIG_DIR\config.yaml" -Color "Green"
 Write-ColorOutput "   code $CONFIG_DIR\config.yaml" -Color "Green"
 Write-Host ""
-Write-ColorOutput "3. Start using Mini Agent:" -Color "Yellow"
-Write-ColorOutput "   mini-agent                              # Use current directory" -Color "Green"
-Write-ColorOutput "   mini-agent --workspace C:\path\to\project # Specify workspace" -Color "Green"
-Write-ColorOutput "   mini-agent --help                      # Show help" -Color "Green"
+Write-ColorOutput "3. Start using Big-A-Helper:" -Color "Yellow"
+Write-ColorOutput "   big-a-helper                              # Use current directory" -Color "Green"
+Write-ColorOutput "   big-a-helper --workspace C:\path\to\project # Specify workspace" -Color "Green"
+Write-ColorOutput "   big-a-helper --help                      # Show help" -Color "Green"
 Write-Host ""

@@ -1,8 +1,8 @@
-# Mini-Agent 项目指南
+# Big-A-Helper 项目指南
 
 ## 1. 一句话理解项目
 
-Mini-Agent 是一个“事件驱动 + LLM 决策 + 模拟交易 + 历史回测”的股票策略实验 CLI。
+Big-A-Helper 是一个“事件驱动 + LLM 决策 + 模拟交易 + 历史回测”的股票策略实验 CLI。
 
 ---
 
@@ -61,23 +61,23 @@ uv sync
 ### 5.2 启动交互会话（CLI 本身就是一个 session）
 
 ```bash
-mini-agent
+big-a-helper
 ```
 
 ### 5.3 创建实验 session
 
 ```bash
-mini-agent session create --name test --prompt "你是交易助手" --mode backtest --initial-capital 100000
-mini-agent session list
-mini-agent session start 1
+big-a-helper session create --name test --prompt "你是交易助手" --mode backtest --initial-capital 100000
+big-a-helper session list
+big-a-helper session start 1
 ```
 
 ### 5.4 同步 K 线
 
 ```bash
-mini-agent sync 600519,000001 --start 2020-01-01
-mini-agent sync --all   # 默认当日增量同步（需 config.yaml 配置 tools.tushare_token）
-mini-agent sync --cron
+big-a-helper sync 600519,000001 --start 2020-01-01
+big-a-helper sync --all   # 默认当日增量同步（需 config.yaml 配置 tools.tushare_token）
+big-a-helper sync --cron
 ```
 
 ### 5.4.1 配置 cron（每日自动运行）
@@ -87,14 +87,14 @@ mini-agent sync --cron
 1. 自动安装（推荐）
 
 ```bash
-mini-agent sync --install-cron
+big-a-helper sync --install-cron
 crontab -l
 ```
 
 会写入两条工作日任务：
 
-- `16:00`：同步当日行情（`mini-agent sync --all --start ...`）
-- `16:05`：触发每日复盘事件（`mini-agent event trigger daily_review --all`）
+- `16:00`：同步当日行情（`big-a-helper sync --all --start ...`）
+- `16:05`：触发每日复盘事件（`big-a-helper event trigger daily_review --all`）
 
 2. 手工安装（自定义时间/命令时使用）
 
@@ -105,45 +105,45 @@ crontab -e
 加入（示例，按你的项目绝对路径修改）：
 
 ```cron
-0 16 * * 1-5 cd /home/lijiang/workspace/Mini-Agent && mini-agent sync --all
-5 16 * * 1-5 cd /home/lijiang/workspace/Mini-Agent && mini-agent event trigger daily_review --all
+0 16 * * 1-5 cd /home/lijiang/workspace/Mini-Agent && big-a-helper sync --all
+5 16 * * 1-5 cd /home/lijiang/workspace/Mini-Agent && big-a-helper event trigger daily_review --all
 ```
 
 验收与排查：
 
 ```bash
 crontab -l
-mini-agent session list   # 确认有在线 session，否则 --all 可能没有目标
+big-a-helper session list   # 确认有在线 session，否则 --all 可能没有目标
 ```
 
 注意：
 
 - `event trigger --all` 只会投递给“在线”session（有运行中的 CLI runtime）。
-- 生产建议用绝对路径命令（如 `uv run python -m mini_agent.cli ...`）避免 PATH 差异导致 cron 找不到 `mini-agent`。
+- 生产建议用绝对路径命令（如 `uv run python -m mini_agent.cli ...`）避免 PATH 差异导致 cron 找不到 `big-a-helper`。
 
 ### 5.5 事件触发
 
 ```bash
-mini-agent event trigger daily_review --session 1
-mini-agent event trigger daily_review --all
-mini-agent event trigger daily_review --session 1 --debug  # 调试模式：强制唯一 event_id，跳过重复拦截
+big-a-helper event trigger daily_review --session 1
+big-a-helper event trigger daily_review --all
+big-a-helper event trigger daily_review --session 1 --debug  # 调试模式：强制唯一 event_id，跳过重复拦截
 ```
 
 ### 5.6 模拟交易
 
 ```bash
-mini-agent trade buy 600519 100 --session 1 --date 2024-06-03
-mini-agent trade sell 600519 100 --session 1 --date 2024-06-05
-mini-agent trade positions --session 1
-mini-agent trade profit --session 1
+big-a-helper trade buy 600519 100 --session 1 --date 2024-06-03
+big-a-helper trade sell 600519 100 --session 1 --date 2024-06-05
+big-a-helper trade positions --session 1
+big-a-helper trade profit --session 1
 ```
 
 ### 5.7 回测
 
 ```bash
-mini-agent backtest run --session 1 --start 2024-01-01 --end 2024-12-31
-mini-agent backtest run --session 1 --start 2024-01-01 --end 2024-12-31 --gate
-mini-agent backtest result --session 1
+big-a-helper backtest run --session 1 --start 2024-01-01 --end 2024-12-31
+big-a-helper backtest run --session 1 --start 2024-01-01 --end 2024-12-31 --gate
+big-a-helper backtest result --session 1
 ```
 
 ---
@@ -202,9 +202,9 @@ mini-agent backtest result --session 1
 
 ## 7. 最小可用运行顺序（推荐）
 
-1. `mini-agent sync --all --start 2018-01-01`
-2. `mini-agent session create ... --mode backtest`
-3. `mini-agent backtest run --session <id> --start ... --end ...`
+1. `big-a-helper sync --all --start 2018-01-01`
+2. `big-a-helper session create ... --mode backtest`
+3. `big-a-helper backtest run --session <id> --start ... --end ...`
 4. 看结果后调整 prompt，再创建新 session 对比。
 
 ---

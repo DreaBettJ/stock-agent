@@ -7,6 +7,7 @@ import inspect
 import logging
 import math
 import sqlite3
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -196,6 +197,7 @@ class BacktestEngine:
         logger.info("Session started for backtest: session=%s", session.session_id)
 
         # 5) 按交易日逐日回放。
+        run_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:6]}"
         total_days = len(trading_days)
         for idx, trading_day in enumerate(trading_days, 1):
             if idx <= 5 or idx == total_days or idx % 20 == 0:
@@ -204,6 +206,7 @@ class BacktestEngine:
             
             # Generate event
             event = self.historical_generator.generate_daily_review_event(trading_day)
+            event["event_id"] = f"backtest:{session.session_id}:{run_id}:daily_review:{trading_day}"
             if event.get("error"):
                 logger.warning("Generated event with warning on %s: %s", trading_day, event.get("error"))
             

@@ -31,6 +31,7 @@ class ExperimentSession:
     stop_loss_pct: float = 7.0
     take_profit_pct: float = 15.0
     investment_horizon: str = "中线"
+    trade_notice_enabled: bool = False
     status: SessionStatus = "stopped"
     is_listening: bool = False
     backtest_start: date | None = None
@@ -99,6 +100,7 @@ class SessionManager:
                 stop_loss_pct REAL DEFAULT 7.0,
                 take_profit_pct REAL DEFAULT 15.0,
                 investment_horizon TEXT DEFAULT '中线',
+                trade_notice_enabled INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'stopped',
                 is_listening INTEGER DEFAULT 0,
                 backtest_start TEXT,
@@ -312,6 +314,7 @@ class SessionManager:
             ("stop_loss_pct", "REAL DEFAULT 7.0"),
             ("take_profit_pct", "REAL DEFAULT 15.0"),
             ("investment_horizon", "TEXT DEFAULT '中线'"),
+            ("trade_notice_enabled", "INTEGER DEFAULT 0"),
         ]
         for name, ddl in desired:
             if name not in existing:
@@ -334,6 +337,7 @@ class SessionManager:
             INSERT INTO sessions_new (
                 name, system_prompt, mode, initial_capital, current_cash,
                 risk_preference, max_single_loss_pct, single_position_cap_pct, stop_loss_pct, take_profit_pct, investment_horizon,
+                trade_notice_enabled,
                 status, is_listening,
                 backtest_start, backtest_end, current_date, event_filter, created_at, updated_at, legacy_session_id
             )
@@ -349,6 +353,7 @@ class SessionManager:
                 7.0,
                 15.0,
                 '中线',
+                0,
                 COALESCE(status, 'stopped'),
                 COALESCE(is_listening, 0),
                 backtest_start,
@@ -382,6 +387,7 @@ class SessionManager:
                 stop_loss_pct REAL DEFAULT 7.0,
                 take_profit_pct REAL DEFAULT 15.0,
                 investment_horizon TEXT DEFAULT '中线',
+                trade_notice_enabled INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'stopped',
                 is_listening INTEGER DEFAULT 0,
                 backtest_start TEXT,
@@ -455,6 +461,7 @@ class SessionManager:
             stop_loss_pct=float(row["stop_loss_pct"] if row["stop_loss_pct"] is not None else 7.0),
             take_profit_pct=float(row["take_profit_pct"] if row["take_profit_pct"] is not None else 15.0),
             investment_horizon=str(row["investment_horizon"] or "中线"),
+            trade_notice_enabled=bool(row["trade_notice_enabled"] if row["trade_notice_enabled"] is not None else 0),
             status=self._normalize_status(row["status"]),
             is_listening=bool(row["is_listening"]),
             backtest_start=self._parse_date(row["backtest_start"]),
@@ -477,6 +484,7 @@ class SessionManager:
         stop_loss_pct = float(kwargs.get("stop_loss_pct", 7.0))
         take_profit_pct = float(kwargs.get("take_profit_pct", 15.0))
         investment_horizon = str(kwargs.get("investment_horizon", "中线")).strip() or "中线"
+        trade_notice_enabled = bool(kwargs.get("trade_notice_enabled", False))
         backtest_start = self._serialize_date(kwargs.get("backtest_start"))
         backtest_end = self._serialize_date(kwargs.get("backtest_end"))
         current_date = self._serialize_date(kwargs.get("current_date"))
@@ -496,10 +504,11 @@ class SessionManager:
                         name, system_prompt, mode,
                         initial_capital, current_cash, risk_preference,
                         max_single_loss_pct, single_position_cap_pct, stop_loss_pct, take_profit_pct, investment_horizon,
+                        trade_notice_enabled,
                         status, is_listening,
                         backtest_start, backtest_end, current_date,
                         event_filter, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', 0, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', 0, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         name,
@@ -513,6 +522,7 @@ class SessionManager:
                         stop_loss_pct,
                         take_profit_pct,
                         investment_horizon,
+                        1 if trade_notice_enabled else 0,
                         backtest_start,
                         backtest_end,
                         current_date,
@@ -530,6 +540,7 @@ class SessionManager:
                         session_id, name, system_prompt, mode,
                         initial_capital, current_cash, risk_preference,
                         max_single_loss_pct, single_position_cap_pct, stop_loss_pct, take_profit_pct, investment_horizon,
+                        trade_notice_enabled,
                         status, is_listening,
                         backtest_start, backtest_end, current_date,
                         event_filter, created_at, updated_at
@@ -548,6 +559,7 @@ class SessionManager:
                         stop_loss_pct,
                         take_profit_pct,
                         investment_horizon,
+                        1 if trade_notice_enabled else 0,
                         backtest_start,
                         backtest_end,
                         current_date,
@@ -625,6 +637,7 @@ class SessionManager:
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
         investment_horizon: str | None = None,
+        trade_notice_enabled: bool | None = None,
     ) -> None:
         """Update session-level trading risk configuration."""
         fields: dict[str, Any] = {}
@@ -643,6 +656,8 @@ class SessionManager:
             fields["take_profit_pct"] = float(take_profit_pct)
         if investment_horizon is not None:
             fields["investment_horizon"] = str(investment_horizon).strip() or "中线"
+        if trade_notice_enabled is not None:
+            fields["trade_notice_enabled"] = 1 if bool(trade_notice_enabled) else 0
         if not fields:
             return
         self._update_session(self._normalize_session_id(session_id), **fields)

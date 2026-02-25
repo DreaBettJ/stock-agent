@@ -247,3 +247,23 @@ class TestBacktestEngine:
         trades = setup["engine"]._get_session_trades(setup["session_id"])
         
         assert isinstance(trades, list)
+
+    @pytest.mark.asyncio
+    async def test_backtest_generates_run_scoped_event_ids(self, setup_engine):
+        setup = setup_engine
+        captured_events: list[dict] = []
+
+        class _Broadcaster:
+            async def trigger_session(self, session, event):
+                captured_events.append(dict(event))
+                return {"ok": True}
+
+        setup["engine"].event_broadcaster = _Broadcaster()
+        await setup["engine"].run(
+            session_id=setup["session_id"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+        )
+
+        assert captured_events
+        assert all(str(e.get("event_id") or "").startswith(f"backtest:{setup['session_id']}:") for e in captured_events)

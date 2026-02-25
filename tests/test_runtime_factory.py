@@ -78,6 +78,26 @@ def test_build_runtime_session_context_attach_mode_mismatch(tmp_path: Path):
         )
 
 
+def test_build_runtime_session_context_attach_without_mode_check(tmp_path: Path):
+    db_path = tmp_path / "runtime_factory_mode_relaxed.db"
+    manager = SessionManager(db_path=str(db_path))
+    sid = manager.create_session(
+        name="seed-backtest",
+        system_prompt="seed",
+        mode="backtest",
+    )
+
+    ctx = build_runtime_session_context(
+        memory_db_path=db_path,
+        system_prompt="x",
+        attach_session_id=sid,
+        mode=None,
+    )
+    assert ctx.session_id == sid
+    assert ctx.attached is True
+    ctx.close(stop_session=True)
+
+
 def test_build_runtime_session_context_create_with_profile_kwargs(tmp_path: Path):
     db_path = tmp_path / "runtime_factory_profile.db"
     ctx = build_runtime_session_context(

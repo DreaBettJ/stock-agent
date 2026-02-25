@@ -247,15 +247,15 @@ def sync_kline_data(
 def build_cron_lines(cwd: Path, start: str | None = None) -> list[str]:
     _ = start
     return [
-        f"0 16 * * 1-5 cd {cwd} && mini-agent sync --all",
-        f"5 16 * * 1-5 cd {cwd} && mini-agent event trigger daily_review --all",
+        f"0 16 * * 1-5 cd {cwd} && big-a-helper sync --all",
+        f"5 16 * * 1-5 cd {cwd} && big-a-helper event trigger daily_review --all",
     ]
 
 
 def install_cron_lines(cwd: Path, start: str | None = None) -> tuple[bool, str]:
-    """Install/replace mini-agent cron block in current user's crontab."""
-    begin = "# >>> mini-agent auto-sync >>>"
-    end = "# <<< mini-agent auto-sync <<<"
+    """Install/replace big-a-helper cron block in current user's crontab."""
+    begin = "# >>> big-a-helper auto-sync >>>"
+    end = "# <<< big-a-helper auto-sync <<<"
     block_lines = [begin, *build_cron_lines(cwd, start), end]
     new_block = "\n".join(block_lines)
 

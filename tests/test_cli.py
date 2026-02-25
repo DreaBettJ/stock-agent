@@ -195,6 +195,31 @@ def test_parse_args_session_create_risk_fields(monkeypatch):
     assert args.stop_loss_pct == 6.0
 
 
+def test_parse_args_session_create_trade_notice_enabled(monkeypatch):
+    from mini_agent.cli import parse_args
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mini-agent",
+            "session",
+            "create",
+            "--name",
+            "s1",
+            "--prompt",
+            "p",
+            "--mode",
+            "simulation",
+            "--trade-notice-enabled",
+        ],
+    )
+    args = parse_args()
+    assert args.command == "session"
+    assert args.session_command == "create"
+    assert args.trade_notice_enabled is True
+
+
 def test_parse_args_trade_action_logs(monkeypatch):
     from mini_agent.cli import parse_args
 
@@ -331,6 +356,107 @@ def test_record_sim_trade_critical_from_messages(tmp_path):
     rows = manager.list_critical_memories(sid, limit=10)
     assert len(rows) == 1
     assert rows[0]["operation"] == "buy"
+
+
+def test_record_daily_review_critical_memory(tmp_path):
+    from mini_agent.cli import _record_daily_review_critical_memory
+    from mini_agent.session import SessionManager
+
+    db_path = tmp_path / "m2.db"
+    manager = SessionManager(db_path=str(db_path))
+    sid = manager.create_session(name="s2", system_prompt="p", mode="backtest")
+
+    decision = {
+        "agent_analysis": "执行买入",
+        "trade_signal": {"action": "buy", "ticker": "301526", "quantity": 200},
+        "trade_actions": [{"action": "buy", "ticker": "301526", "quantity": 200, "trade_date": "2026-02-25"}],
+        "execution": "SIM_TRADE_OK id=1 action=buy ticker=301526 qty=200",
+        "execution_error": None,
+    }
+    _record_daily_review_critical_memory(
+        session_manager=manager,
+        session_id=sid,
+        event_id="backtest:32:run:daily_review:2026-02-25",
+        event_type="daily_review",
+        trading_date="2026-02-25",
+        decision=decision,
+    )
+    rows = manager.list_critical_memories(sid, limit=10)
+    assert len(rows) == 1
+    assert rows[0]["operation"] == "buy"
+
+
+def test_maybe_emit_trade_notice_respects_p0_switch(tmp_path, monkeypatch, capsys):
+    from mini_agent.cli import _maybe_emit_trade_notice
+    from mini_agent.config import AgentConfig, Config, LLMConfig, NoticeLevelConfig, ToolsConfig
+    from mini_agent.session import SessionManager
+
+    db_path = tmp_path / "n1.db"
+    manager = SessionManager(db_path=str(db_path))
+    sid = manager.create_session(
+        name="n1",
+        system_prompt="p",
+        mode="simulation",
+        trade_notice_enabled=True,
+    )
+    cfg = Config(
+        llm=LLMConfig(api_key="test"),
+        agent=AgentConfig(),
+        tools=ToolsConfig(),
+        notice_levels=NoticeLevelConfig(p0_trade_realtime=False, p1_risk_realtime=False, p2_digest=False),
+    )
+    monkeypatch.setattr("mini_agent.cli.Config.from_yaml", lambda _: cfg)
+    monkeypatch.setattr("mini_agent.cli.Config.get_default_config_path", lambda: Path("/tmp/fake.yaml"))
+    _maybe_emit_trade_notice(
+        session_manager=manager,
+        session_id=sid,
+        trading_date="2026-02-25",
+        decision={"trade_actions": [{"action": "buy", "ticker": "600519", "quantity": 1}], "execution": "ok"},
+    )
+    out = capsys.readouterr().out
+    assert "NOTICE" not in out
+
+
+def test_maybe_emit_p1_risk_notice_on_no_trade_with_veto(tmp_path, monkeypatch, capsys):
+    from mini_agent.cli import _maybe_emit_p1_risk_notice
+    from mini_agent.config import (
+        AgentConfig,
+        Config,
+        LLMConfig,
+        NoticeLevelConfig,
+        NoticeRiskConfig,
+        ToolsConfig,
+    )
+    from mini_agent.session import SessionManager
+
+    db_path = tmp_path / "n2.db"
+    manager = SessionManager(db_path=str(db_path))
+    sid = manager.create_session(
+        name="n2",
+        system_prompt="p",
+        mode="simulation",
+        trade_notice_enabled=True,
+    )
+    cfg = Config(
+        llm=LLMConfig(api_key="test"),
+        agent=AgentConfig(),
+        tools=ToolsConfig(),
+        notice_levels=NoticeLevelConfig(p0_trade_realtime=True, p1_risk_realtime=True, p2_digest=False),
+        notice_risk=NoticeRiskConfig(no_trade_with_veto=True, consecutive_failures_threshold=3),
+    )
+    monkeypatch.setattr("mini_agent.cli.Config.from_yaml", lambda _: cfg)
+    monkeypatch.setattr("mini_agent.cli.Config.get_default_config_path", lambda: Path("/tmp/fake.yaml"))
+    _maybe_emit_p1_risk_notice(
+        session_manager=manager,
+        session_id=sid,
+        trading_date="2026-02-25",
+        decision={
+            "trade_actions": [],
+            "daily_pipeline": {"rule_engine": {"veto_reasons": ["x:chase_limit"]}},
+        },
+    )
+    out = capsys.readouterr().out
+    assert "P1 RISK NOTICE" in out
 
 
 def test_load_strategy_templates(tmp_path):

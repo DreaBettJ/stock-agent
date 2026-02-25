@@ -200,11 +200,11 @@
 
 ```bash
 # 均线趋势策略
-mini-agent session create --name "均线策略" --prompt "你是均线趋势策略..." --mode simulation
+big-a-helper session create --name "均线策略" --prompt "你是均线趋势策略..." --mode simulation
 
 # 高股息策略  
-mini-agent session create --name "高股息" --prompt "你是高股息策略..." --mode simulation
+big-a-helper session create --name "高股息" --prompt "你是高股息策略..." --mode simulation
 
 # 龙头股策略
-mini-agent session create --name "龙头股" --prompt "你是龙头股趋势策略..." --mode simulation
+big-a-helper session create --name "龙头股" --prompt "你是龙头股趋势策略..." --mode simulation
 ```

@@ -139,8 +139,9 @@ class TestAgentLogger:
         assert logger.intercept_log_file.exists()
         
         # Verify JSONL format
-        with open(logger.intercept_log_file) as f:
-            line = f.readline()
+        with open(logger.intercept_log_file, encoding="utf-8") as f:
+            lines = [ln for ln in f.readlines() if ln.strip()]
+            line = lines[-1]
             event_data = json.loads(line)
             assert event_data["event"] == "request"
             assert event_data["model"] == "test-model"
@@ -171,18 +172,36 @@ class TestAgentLogger:
         assert path.name.startswith("agent_intercept_")
 
     def test_multiple_runs(self, logger_with_temp_dir):
-        """Test multiple runs create separate log files."""
-        import time
+        """Test multiple starts reuse same session log file path."""
         logger = logger_with_temp_dir
         
         logger.start_new_run()
         first_log = logger.log_file
         
-        time.sleep(1.1)  # Wait to ensure different timestamp
         logger.start_new_run()
         second_log = logger.log_file
         
-        assert first_log != second_log
+        assert first_log == second_log
+
+    def test_start_new_run_appends_without_truncating_existing_file(self, logger_with_temp_dir):
+        """Logger should append marker and preserve existing contents."""
+        logger = logger_with_temp_dir
+        logger.start_new_run()
+        logger._write_log("REQUEST", "first")
+        first_size = logger.log_file.stat().st_size
+
+        # Simulate process re-attach/new logger instance on same session file.
+        logger.log_file = None
+        logger.intercept_log_file = None
+        created = logger.start_new_run()
+        assert created is False
+
+        second_size = logger.log_file.stat().st_size
+        assert second_size > first_size
+        with open(logger.log_file, encoding="utf-8") as f:
+            content = f.read()
+        assert "first" in content
+        assert "Agent Run Reattached" in content
 
     def test_write_log_type(self, logger_with_temp_dir):
         """Test writing different log types."""

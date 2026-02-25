@@ -144,6 +144,72 @@ wheels = [
 ]
 
 [[package]]
+name = "big-a-helper"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "agent-client-protocol" },
+    { name = "akshare" },
+    { name = "anthropic" },
+    { name = "httpx" },
+    { name = "mcp" },
+    { name = "openai" },
+    { name = "pip" },
+    { name = "pipx" },
+    { name = "playwright" },
+    { name = "prompt-toolkit" },
+    { name = "pydantic" },
+    { name = "pytest" },
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "tiktoken" },
+    { name = "tushare" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-xdist" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "agent-client-protocol", specifier = ">=0.6.0" },
+    { name = "akshare", specifier = ">=1.16.0" },
+    { name = "anthropic", specifier = ">=0.39.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
+    { name = "mcp", specifier = ">=1.0.0" },
+    { name = "openai", specifier = ">=1.57.4" },
+    { name = "pip", specifier = ">=25.3" },
+    { name = "pipx", specifier = ">=1.8.0" },
+    { name = "playwright", specifier = ">=1.52.0" },
+    { name = "prompt-toolkit", specifier = ">=3.0.0" },
+    { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "pytest", specifier = ">=8.4.2" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
+    { name = "pyyaml", specifier = ">=6.0.0" },
+    { name = "requests", specifier = ">=2.31.0" },
+    { name = "tiktoken", specifier = ">=0.5.0" },
+    { name = "tushare", specifier = ">=1.4.24" },
+]
+provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest-asyncio", specifier = ">=1.2.0" },
+    { name = "pytest-cov", specifier = ">=7.0.0" },
+    { name = "pytest-xdist", specifier = ">=3.8.0" },
+]
+
+[[package]]
 name = "bs4"
 version = "0.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -951,72 +1017,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/69/2b/916852a5668f45d8787378461eaa1244876d77575ffef024483c94c0649c/mcp-1.19.0.tar.gz", hash = "sha256:213de0d3cd63f71bc08ffe9cc8d4409cc87acffd383f6195d2ce0457c021b5c1", size = 444163, upload-time = "2025-10-24T01:11:15.839Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ce/a3/3e71a875a08b6a830b88c40bc413bff01f1650f1efe8a054b5e90a9d4f56/mcp-1.19.0-py3-none-any.whl", hash = "sha256:f5907fe1c0167255f916718f376d05f09a830a215327a3ccdd5ec8a519f2e572", size = 170105, upload-time = "2025-10-24T01:11:14.151Z" },
-]
-
-[[package]]
-name = "mini-agent"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "agent-client-protocol" },
-    { name = "akshare" },
-    { name = "anthropic" },
-    { name = "httpx" },
-    { name = "mcp" },
-    { name = "openai" },
-    { name = "pip" },
-    { name = "pipx" },
-    { name = "playwright" },
-    { name = "prompt-toolkit" },
-    { name = "pydantic" },
-    { name = "pytest" },
-    { name = "pyyaml" },
-    { name = "requests" },
-    { name = "tiktoken" },
-    { name = "tushare" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-xdist" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "agent-client-protocol", specifier = ">=0.6.0" },
-    { name = "akshare", specifier = ">=1.16.0" },
-    { name = "anthropic", specifier = ">=0.39.0" },
-    { name = "httpx", specifier = ">=0.27.0" },
-    { name = "mcp", specifier = ">=1.0.0" },
-    { name = "openai", specifier = ">=1.57.4" },
-    { name = "pip", specifier = ">=25.3" },
-    { name = "pipx", specifier = ">=1.8.0" },
-    { name = "playwright", specifier = ">=1.52.0" },
-    { name = "prompt-toolkit", specifier = ">=3.0.0" },
-    { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "pytest", specifier = ">=8.4.2" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
-    { name = "pyyaml", specifier = ">=6.0.0" },
-    { name = "requests", specifier = ">=2.31.0" },
-    { name = "tiktoken", specifier = ">=0.5.0" },
-    { name = "tushare", specifier = ">=1.4.24" },
-]
-provides-extras = ["dev"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest-asyncio", specifier = ">=1.2.0" },
-    { name = "pytest-cov", specifier = ">=7.0.0" },
-    { name = "pytest-xdist", specifier = ">=3.8.0" },
 ]
 
 [[package]]

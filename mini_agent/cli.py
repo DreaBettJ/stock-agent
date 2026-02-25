@@ -1,14 +1,14 @@
 """
-Mini Agent - Interactive Runtime Example
+Big A Helper - Interactive Runtime Example
 
 Usage:
-    mini-agent [--workspace DIR] [--task TASK] [--session-id ID]
+    big-a-helper [--workspace DIR] [--task TASK] [--session-id ID]
 
 Examples:
-    mini-agent                              # Use current directory as workspace (interactive mode)
-    mini-agent --workspace /path/to/dir     # Use specific workspace directory (interactive mode)
-    mini-agent --task "create a file"       # Execute a task non-interactively
-    mini-agent --session-id 8               # Attach to existing session 8
+    big-a-helper                              # Use current directory as workspace (interactive mode)
+    big-a-helper --workspace /path/to/dir     # Use specific workspace directory (interactive mode)
+    big-a-helper --task "create a file"       # Execute a task non-interactively
+    big-a-helper --session-id 8               # Attach to existing session 8
 """
 
 import argparse
@@ -43,6 +43,7 @@ from mini_agent.app.memory_service import (
     load_critical_session_memories,
     load_recent_session_memories,
 )
+from mini_agent.app.notice_service import send_smtp_notice
 from mini_agent.app.prompt_guard import ensure_trade_policy_prompt
 from mini_agent.app.runtime_factory import build_runtime_session_context
 from mini_agent.app.sync_service import build_cron_lines, install_cron_lines, resolve_ticker_universe, sync_kline_data
@@ -204,7 +205,7 @@ def read_log_file(filename: str) -> None:
 def print_banner():
     """Print welcome banner with proper alignment"""
     BOX_WIDTH = 58
-    banner_text = f"{Colors.BOLD}🤖 Mini Agent - Multi-turn Interactive Session{Colors.RESET}"
+    banner_text = f"{Colors.BOLD}🤖 Big A Helper - Multi-turn Interactive Session{Colors.RESET}"
     banner_width = calculate_display_width(banner_text)
 
     # Center the text with proper padding
@@ -492,6 +493,7 @@ def _collect_session_create_inputs(args: argparse.Namespace, workspace_dir: Path
     stop_loss_pct = args.stop_loss_pct
     take_profit_pct = args.take_profit_pct
     investment_horizon = args.investment_horizon or "中线"
+    trade_notice_enabled = bool(getattr(args, "trade_notice_enabled", False))
     event_filter = args.event_filter or []
     prompt = args.prompt
     template_selector = args.template
@@ -577,6 +579,7 @@ def _collect_session_create_inputs(args: argparse.Namespace, workspace_dir: Path
         "stop_loss_pct": float(stop_loss_pct),
         "take_profit_pct": float(take_profit_pct),
         "investment_horizon": str(investment_horizon).strip() or "中线",
+        "trade_notice_enabled": bool(trade_notice_enabled),
         "event_filter": event_filter,
     }
 
@@ -598,6 +601,7 @@ def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> Non
             stop_loss_pct=payload["stop_loss_pct"],
             take_profit_pct=payload["take_profit_pct"],
             investment_horizon=payload["investment_horizon"],
+            trade_notice_enabled=payload["trade_notice_enabled"],
             event_filter=payload["event_filter"],
         )
         print(f"{Colors.GREEN}✅ Session created{Colors.RESET}")
@@ -611,6 +615,7 @@ def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> Non
         print(f"stop_loss_pct: {payload['stop_loss_pct']:.2f}")
         print(f"take_profit_pct: {payload['take_profit_pct']:.2f}")
         print(f"investment_horizon: {payload['investment_horizon']}")
+        print(f"trade_notice_enabled: {payload['trade_notice_enabled']}")
         return
 
     if args.session_command == "list":
@@ -647,6 +652,7 @@ def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> Non
                 stop_loss_pct=args.stop_loss_pct,
                 take_profit_pct=args.take_profit_pct,
                 investment_horizon=args.investment_horizon,
+                trade_notice_enabled=args.trade_notice_enabled,
             )
             if any(
                 value is not None
@@ -657,6 +663,7 @@ def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> Non
                     args.stop_loss_pct,
                     args.take_profit_pct,
                     args.investment_horizon,
+                    args.trade_notice_enabled,
                 )
             ):
                 updated = True
@@ -805,6 +812,183 @@ def _record_sim_trade_critical_from_messages(
         )
 
 
+def _record_daily_review_critical_memory(
+    *,
+    session_manager: SessionManager,
+    session_id: int,
+    event_id: str | None,
+    event_type: str,
+    trading_date: str,
+    decision: dict[str, Any],
+) -> None:
+    """Persist daily-review decision/execution snapshot into critical memories."""
+    trade_actions = list(decision.get("trade_actions") or [])
+    signal = decision.get("trade_signal")
+    execution = decision.get("execution")
+    execution_error = decision.get("execution_error")
+    final_reply = str(decision.get("agent_analysis") or "")
+
+    primary_action = trade_actions[0] if trade_actions else (signal if isinstance(signal, dict) else None)
+    signal_action = str(primary_action.get("action")) if isinstance(primary_action, dict) else None
+    signal_ticker = str(primary_action.get("ticker")) if isinstance(primary_action, dict) else None
+    signal_qty = primary_action.get("quantity") if isinstance(primary_action, dict) else None
+
+    op: str | None = None
+    if execution_error:
+        op = f"{signal_action}_failed" if signal_action else "trade_failed"
+    elif execution:
+        if signal_action:
+            op = signal_action
+        else:
+            parsed_exec = _parse_sim_trade_tool_content(str(execution))
+            parsed_action = str(parsed_exec.get("action") or "").strip()
+            op = parsed_action or "trade_executed"
+    elif signal_action:
+        op = f"{signal_action}_planned"
+
+    if not op:
+        return
+
+    reason = final_reply.strip().replace("\n", " ")[:500] or None
+    critical_content = json.dumps(
+        {
+            "date": trading_date,
+            "signal": signal,
+            "trade_actions": trade_actions,
+            "execution": execution,
+            "execution_error": execution_error,
+            "ticker": signal_ticker,
+            "quantity": signal_qty,
+        },
+        ensure_ascii=False,
+    )
+    session_manager.record_critical_memory(
+        session_id=session_id,
+        event_id=(event_id or "") or None,
+        event_type=event_type,
+        operation=op,
+        reason=reason,
+        content=critical_content,
+    )
+
+
+def _maybe_emit_trade_notice(
+    *,
+    session_manager: SessionManager,
+    session_id: int,
+    trading_date: str,
+    decision: dict[str, Any],
+    notice_prefix: str = "NOTICE",
+) -> None:
+    """Emit P0 trade notice if enabled (console + SMTP)."""
+    try:
+        session = session_manager.get_session(session_id)
+    except Exception:
+        return
+    if not bool(getattr(session, "trade_notice_enabled", False)):
+        return
+
+    try:
+        cfg = Config.from_yaml(Config.get_default_config_path())
+    except Exception:
+        cfg = None
+    if cfg is not None and not bool(getattr(cfg.notice_levels, "p0_trade_realtime", True)):
+        return
+
+    trade_actions = list(decision.get("trade_actions") or [])
+    execution = decision.get("execution")
+    execution_error = decision.get("execution_error")
+    if not execution and not execution_error:
+        return
+    if trade_actions:
+        action = trade_actions[0]
+        side = str(action.get("action") or "")
+        ticker = str(action.get("ticker") or "")
+        qty = int(action.get("quantity") or 0)
+        summary = f"{side} {ticker} x{qty}"
+    else:
+        summary = "trade executed"
+    status_text = "SUCCESS" if execution and not execution_error else f"FAILED: {execution_error}"
+    msg = f"{notice_prefix}: {summary} @ {trading_date} ({status_text})"
+    print(f"\n{Colors.BRIGHT_YELLOW}{msg}{Colors.RESET}\n")
+
+    try:
+        if cfg is None:
+            cfg = Config.from_yaml(Config.get_default_config_path())
+        smtp_cfg = cfg.notice.smtp
+        if not smtp_cfg.enabled:
+            return
+        subject = f"{smtp_cfg.subject_prefix} {notice_prefix} session={session_id}"
+        body = (
+            f"session_id: {session_id}\n"
+            f"date: {trading_date}\n"
+            f"summary: {summary}\n"
+            f"status: {status_text}\n"
+            f"execution: {execution or ''}\n"
+            f"execution_error: {execution_error or ''}\n"
+        )
+        send_smtp_notice(cfg=smtp_cfg, subject=subject, body=body)
+    except Exception as exc:
+        print(f"{Colors.YELLOW}⚠️ SMTP notice failed: {exc}{Colors.RESET}")
+
+
+def _maybe_emit_p1_risk_notice(
+    *,
+    session_manager: SessionManager,
+    session_id: int,
+    trading_date: str,
+    decision: dict[str, Any],
+    notice_prefix: str = "P1 RISK NOTICE",
+) -> None:
+    """Emit P1 risk notice on no-trade-with-veto or consecutive failures."""
+    try:
+        session = session_manager.get_session(session_id)
+    except Exception:
+        return
+    if not bool(getattr(session, "trade_notice_enabled", False)):
+        return
+
+    try:
+        cfg = Config.from_yaml(Config.get_default_config_path())
+    except Exception:
+        return
+    if not bool(getattr(cfg.notice_levels, "p1_risk_realtime", False)):
+        return
+
+    risk_msgs: list[str] = []
+    trade_actions = list(decision.get("trade_actions") or [])
+    pipeline = decision.get("daily_pipeline") or {}
+    rule_engine = pipeline.get("rule_engine") or {}
+    veto_reasons = list(rule_engine.get("veto_reasons") or [])
+    if (
+        not trade_actions
+        and bool(getattr(cfg.notice_risk, "no_trade_with_veto", True))
+        and veto_reasons
+    ):
+        risk_msgs.append(f"no_trade_with_veto: {', '.join(veto_reasons[:5])}")
+
+    threshold = int(getattr(cfg.notice_risk, "consecutive_failures_threshold", 3) or 3)
+    if threshold > 0:
+        logs = session_manager.list_trade_action_logs(session_id, limit=threshold)
+        if len(logs) >= threshold and all(str(x.get("status") or "") == "failed" for x in logs[:threshold]):
+            risk_msgs.append(f"consecutive_failures: {threshold}")
+
+    if not risk_msgs:
+        return
+
+    msg = f"{notice_prefix}: session={session_id} date={trading_date} | " + " | ".join(risk_msgs)
+    print(f"\n{Colors.BRIGHT_YELLOW}{msg}{Colors.RESET}\n")
+    try:
+        smtp_cfg = cfg.notice.smtp
+        if not smtp_cfg.enabled:
+            return
+        subject = f"{smtp_cfg.subject_prefix} {notice_prefix} session={session_id}"
+        body = f"session_id: {session_id}\ndate: {trading_date}\n" + "\n".join(risk_msgs)
+        send_smtp_notice(cfg=smtp_cfg, subject=subject, body=body)
+    except Exception as exc:
+        print(f"{Colors.YELLOW}⚠️ SMTP notice failed: {exc}{Colors.RESET}")
+
+
 def handle_trade_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle trade subcommands."""
     db_path = get_memory_db_path(workspace_dir)
@@ -823,6 +1007,25 @@ def handle_trade_command(args: argparse.Namespace, workspace_dir: Path) -> None:
                 quantity=args.quantity,
                 trade_date=args.trade_date,
             )
+        )
+        decision_for_notice = {
+            "trade_actions": [
+                {
+                    "action": args.trade_command,
+                    "ticker": args.ticker,
+                    "quantity": int(args.quantity),
+                    "trade_date": str(args.trade_date),
+                }
+            ],
+            "execution": result.content if result.success else None,
+            "execution_error": result.error if not result.success else None,
+        }
+        _maybe_emit_trade_notice(
+            session_manager=trade_tool.session_manager,
+            session_id=int(args.session_id),
+            trading_date=str(args.trade_date),
+            decision=decision_for_notice,
+            notice_prefix="MANUAL TRADE NOTICE",
         )
         if result.success:
             print(f"{Colors.GREEN}{result.content}{Colors.RESET}")
@@ -930,7 +1133,7 @@ def _build_event_from_args(args: argparse.Namespace) -> dict:
 def _match_single_session_for_event(session, event_type: str | None) -> tuple[bool, str | None]:
     """Check whether one session should receive an event."""
     if not session.is_listening:
-        return False, "session is not listening; run `mini-agent session start <id>` first"
+        return False, "session is not listening; run `big-a-helper session start <id>` first"
 
     if event_type and session.event_filter and event_type not in session.event_filter:
         return False, f"session event_filter does not include '{event_type}'"
@@ -978,6 +1181,28 @@ def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> No
             session_id=session.session_id,
             trading_date=str(event.get("date") or ""),
             event_id=str(event.get("event_id") or "") or None,
+        )
+        _record_daily_review_critical_memory(
+            session_manager=runtime.session_manager,
+            session_id=int(session.session_id),
+            event_id=str(event.get("event_id") or "") or None,
+            event_type=str(event.get("type") or "daily_review"),
+            trading_date=str(event.get("date") or ""),
+            decision=result,
+        )
+        _maybe_emit_p1_risk_notice(
+            session_manager=runtime.session_manager,
+            session_id=int(session.session_id),
+            trading_date=str(event.get("date") or ""),
+            decision=result,
+            notice_prefix="BACKTEST P1 NOTICE",
+        )
+        _maybe_emit_trade_notice(
+            session_manager=runtime.session_manager,
+            session_id=int(session.session_id),
+            trading_date=str(event.get("date") or ""),
+            decision=result,
+            notice_prefix="BACKTEST NOTICE",
         )
         if result.get("execution_error"):
             return f"LLM_DECISION_FAIL {result['execution_error']}"
@@ -1220,17 +1445,17 @@ def parse_args() -> argparse.Namespace:
         Parsed arguments
     """
     parser = argparse.ArgumentParser(
-        description="Mini Agent - AI assistant with file tools and MCP support",
+        description="Big A Helper - AI assistant for A-share workflow, backtest and simulation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  mini-agent                              # Use current directory as workspace
-  mini-agent --workspace /path/to/dir     # Use specific workspace directory
-  mini-agent log                          # Show log directory and recent files
-  mini-agent log agent_run_xxx.log        # Read a specific log file
-  mini-agent session create --name test --prompt "..." --mode simulation
-  mini-agent trade buy 600519 100 --session <id>
-  mini-agent event trigger daily_review --all
+  big-a-helper                              # Use current directory as workspace
+  big-a-helper --workspace /path/to/dir     # Use specific workspace directory
+  big-a-helper log                          # Show log directory and recent files
+  big-a-helper log agent_run_xxx.log        # Read a specific log file
+  big-a-helper session create --name test --prompt "..." --mode simulation
+  big-a-helper trade buy 600519 100 --session <id>
+  big-a-helper event trigger daily_review --all
         """,
     )
     parser.add_argument(
@@ -1257,7 +1482,7 @@ Examples:
         "--version",
         "-v",
         action="version",
-        version="mini-agent 0.1.0",
+        version="big-a-helper 0.1.0",
     )
 
     # Subcommands
@@ -1340,6 +1565,12 @@ Examples:
         default=None,
         help="Investment horizon label, e.g. 短线/中线/长线 (interactive if omitted)",
     )
+    session_create.add_argument(
+        "--trade-notice-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable notice output when trade is executed (default: false)",
+    )
 
     session_subparsers.add_parser("list", help="List sessions")
 
@@ -1363,6 +1594,12 @@ Examples:
     session_update.add_argument("--stop-loss-pct", type=float, default=None, help="Stop loss percent")
     session_update.add_argument("--take-profit-pct", type=float, default=None, help="Take profit percent")
     session_update.add_argument("--investment-horizon", default=None, help="Investment horizon label")
+    session_update.add_argument(
+        "--trade-notice-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable notice output when trade is executed",
+    )
 
     session_delete = session_subparsers.add_parser("delete", help="Delete one session")
     session_delete.add_argument("session_id", type=int, help="Session ID")
@@ -1822,6 +2059,10 @@ async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: in
 
     # 6. Create/start runtime session (or attach existing one) with process binding.
     try:
+        runtime_mode = (create_profile or {}).get("mode", "simulation")
+        if attach_session_id is not None:
+            # Attach path should respect existing session mode.
+            runtime_mode = None
         runtime_ctx = build_runtime_session_context(
             memory_db_path=get_memory_db_path(workspace_dir),
             system_prompt=(create_profile or {}).get("system_prompt", system_prompt),
@@ -1829,7 +2070,7 @@ async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: in
             runtime_type="cli",
             session_name_prefix="cli",
             session_name=(create_profile or {}).get("name"),
-            mode=(create_profile or {}).get("mode", "simulation"),
+            mode=runtime_mode,
             initial_capital=float((create_profile or {}).get("initial_capital", 100000.0)),
             create_session_kwargs=(
                 {
@@ -1839,6 +2080,7 @@ async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: in
                     "stop_loss_pct": (create_profile or {}).get("stop_loss_pct"),
                     "take_profit_pct": (create_profile or {}).get("take_profit_pct"),
                     "investment_horizon": (create_profile or {}).get("investment_horizon"),
+                    "trade_notice_enabled": (create_profile or {}).get("trade_notice_enabled"),
                     "event_filter": (create_profile or {}).get("event_filter", []),
                 }
                 if create_profile is not None
@@ -2082,10 +2324,6 @@ async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: in
                     signal = decision.get("trade_signal")
                     execution = decision.get("execution")
                     execution_error = decision.get("execution_error")
-                    primary_action = trade_actions[0] if trade_actions else (signal if isinstance(signal, dict) else None)
-                    signal_action = str(primary_action.get("action")) if isinstance(primary_action, dict) else None
-                    signal_ticker = str(primary_action.get("ticker")) if isinstance(primary_action, dict) else None
-                    signal_qty = primary_action.get("quantity") if isinstance(primary_action, dict) else None
                     summary = (
                         f"[daily_review] actions={trade_actions or signal} execution={execution or execution_error or 'no_trade'} "
                         f"date={trading_date}"
@@ -2102,40 +2340,26 @@ async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: in
                         category="conversation_assistant",
                         content=f"{final_reply}\n\n{summary}".strip(),
                     )
-                    op: str | None = None
-                    if execution_error:
-                        op = f"{signal_action}_failed" if signal_action else "trade_failed"
-                    elif execution:
-                        if signal_action:
-                            op = signal_action
-                        else:
-                            parsed_exec = _parse_sim_trade_tool_content(str(execution))
-                            parsed_action = str(parsed_exec.get("action") or "").strip()
-                            op = parsed_action or "trade_executed"
-                    elif signal_action:
-                        op = f"{signal_action}_planned"
-                    reason = final_reply.strip().replace("\n", " ")[:500]
-                    critical_content = json.dumps(
-                        {
-                            "date": trading_date,
-                            "signal": signal,
-                            "trade_actions": trade_actions,
-                            "execution": execution,
-                            "execution_error": execution_error,
-                            "ticker": signal_ticker,
-                            "quantity": signal_qty,
-                        },
-                        ensure_ascii=False,
+                    _record_daily_review_critical_memory(
+                        session_manager=session_manager,
+                        session_id=int(session_id),
+                        event_id=str(event.get("event_id") or "") or None,
+                        event_type=event_type,
+                        trading_date=trading_date,
+                        decision=decision,
                     )
-                    if op:
-                        session_manager.record_critical_memory(
-                            session_id=session_id,
-                            event_id=str(event.get("event_id") or ""),
-                            event_type=event_type,
-                            operation=op,
-                            reason=reason or None,
-                            content=critical_content,
-                        )
+                    _maybe_emit_trade_notice(
+                        session_manager=session_manager,
+                        session_id=int(session_id),
+                        trading_date=trading_date,
+                        decision=decision,
+                    )
+                    _maybe_emit_p1_risk_notice(
+                        session_manager=session_manager,
+                        session_id=int(session_id),
+                        trading_date=trading_date,
+                        decision=decision,
+                    )
                     success = execution_error is None
                     err = execution_error
                     result_text = summary
@@ -2240,7 +2464,7 @@ async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: in
                 if user_input.startswith("/"):
                     command = user_input.lower()
                     if command in ["/exit", "/quit", "/q"]:
-                        print(f"\n{Colors.BRIGHT_YELLOW}👋 Goodbye! Thanks for using Mini Agent{Colors.RESET}\n")
+                        print(f"\n{Colors.BRIGHT_YELLOW}👋 Goodbye! Thanks for using Big A Helper{Colors.RESET}\n")
                         print_stats(agent, session_start)
                         break
                     if command == "/help":
@@ -2270,7 +2494,7 @@ async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: in
                     continue
 
                 if user_input.lower() in ["exit", "quit", "q"]:
-                    print(f"\n{Colors.BRIGHT_YELLOW}👋 Goodbye! Thanks for using Mini Agent{Colors.RESET}\n")
+                    print(f"\n{Colors.BRIGHT_YELLOW}👋 Goodbye! Thanks for using Big A Helper{Colors.RESET}\n")
                     print_stats(agent, session_start)
                     break
 
