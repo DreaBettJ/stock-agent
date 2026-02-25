@@ -54,6 +54,7 @@ class ToolsConfig(BaseModel):
     enable_bash: bool = True
     enable_note: bool = True
     enable_stock_tools: bool = True
+    tushare_token: str = ""
 
     # Skills
     enable_skills: bool = True
@@ -77,7 +78,9 @@ class Config(BaseModel):
         """Load configuration from the default search path."""
         config_path = cls.get_default_config_path()
         if not config_path.exists():
-            raise FileNotFoundError("Configuration file not found. Run scripts/setup-config.sh or place config.yaml in mini_agent/config/.")
+            raise FileNotFoundError(
+                "Configuration file not found. Run scripts/setup-config.sh or place config.yaml in project root or mini_agent/config/."
+            )
         return cls.from_yaml(config_path)
 
     @classmethod
@@ -154,6 +157,7 @@ class Config(BaseModel):
             enable_bash=tools_data.get("enable_bash", True),
             enable_note=tools_data.get("enable_note", True),
             enable_stock_tools=tools_data.get("enable_stock_tools", True),
+            tushare_token=str(tools_data.get("tushare_token", "") or ""),
             enable_skills=tools_data.get("enable_skills", True),
             skills_dir=tools_data.get("skills_dir", "./skills"),
             enable_mcp=tools_data.get("enable_mcp", True),
@@ -182,9 +186,10 @@ class Config(BaseModel):
         """Find configuration file with priority order
 
         Search for config file in the following order of priority:
-        1) mini_agent/config/{filename} in current directory (development mode)
-        2) ~/.mini-agent/config/{filename} in user home directory
-        3) {package}/mini_agent/config/{filename} in package installation directory
+        1) ./{filename} in current project directory
+        2) ./mini_agent/config/{filename} in current directory (development mode)
+        3) ~/.mini-agent/config/{filename} in user home directory
+        4) {package}/mini_agent/config/{filename} in package installation directory
 
         Args:
             filename: Configuration file name (e.g., "config.yaml", "mcp.json", "system_prompt.md")
@@ -192,17 +197,22 @@ class Config(BaseModel):
         Returns:
             Path to found config file, or None if not found
         """
-        # Priority 1: Development mode - current directory's config/ subdirectory
+        # Priority 1: project root config file
+        project_root_config = Path.cwd() / filename
+        if project_root_config.exists():
+            return project_root_config
+
+        # Priority 2: Development mode - current directory's mini_agent/config/ subdirectory
         dev_config = Path.cwd() / "mini_agent" / "config" / filename
         if dev_config.exists():
             return dev_config
 
-        # Priority 2: User config directory
+        # Priority 3: User config directory
         user_config = Path.home() / ".mini-agent" / "config" / filename
         if user_config.exists():
             return user_config
 
-        # Priority 3: Package installation directory's config/ subdirectory
+        # Priority 4: Package installation directory's config/ subdirectory
         package_config = cls.get_package_dir() / "config" / filename
         if package_config.exists():
             return package_config
@@ -214,7 +224,7 @@ class Config(BaseModel):
         """Get the default config file path with priority search
 
         Returns:
-            Path to config.yaml (prioritizes: dev config/ > user config/ > package config/)
+            Path to config.yaml (prioritizes: project root > dev config/ > user config/ > package config/)
         """
         config_path = cls.find_config_file("config.yaml")
         if config_path:

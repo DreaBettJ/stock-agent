@@ -129,6 +129,7 @@ class TestToolsConfig:
         assert config.enable_bash is True
         assert config.enable_note is True
         assert config.enable_stock_tools is True
+        assert config.tushare_token == ""
         assert config.enable_skills is True
         assert config.skills_dir == "./skills"
         assert config.enable_mcp is True
@@ -138,10 +139,12 @@ class TestToolsConfig:
         config = ToolsConfig(
             enable_file_tools=False,
             enable_bash=False,
+            tushare_token="ts-token-x",
             mcp=MCPConfig(connect_timeout=5.0),
         )
         assert config.enable_file_tools is False
         assert config.enable_bash is False
+        assert config.tushare_token == "ts-token-x"
         assert config.mcp.connect_timeout == 5.0
 
 
@@ -179,6 +182,18 @@ class TestConfig:
         assert config.llm.provider == "openai"
         assert config.agent.max_steps == 100
         assert config.agent.workspace_dir == "/test/workspace"
+        assert config.tools.tushare_token == ""
+
+    def test_load_tools_tushare_token(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            config = {
+                "api_key": "test-api-key-12345",
+                "tools": {"tushare_token": "ts-token-cfg"},
+            }
+            yaml.dump(config, f)
+            path = Path(f.name)
+        loaded = Config.from_yaml(path)
+        assert loaded.tools.tushare_token == "ts-token-cfg"
 
     def test_load_missing_api_key(self, invalid_config_file):
         """Test that missing api_key raises error."""
@@ -221,3 +236,16 @@ class TestConfig:
         result = Config.find_config_file("config.yaml")
         # May return None if no config exists in search paths
         assert result is None or isinstance(result, Path)
+
+    def test_find_config_file_prefers_project_root_over_dev_subdir(self, tmp_path, monkeypatch):
+        root_cfg = tmp_path / "config.yaml"
+        root_cfg.write_text("api_key: test-api-key\n", encoding="utf-8")
+
+        dev_dir = tmp_path / "mini_agent" / "config"
+        dev_dir.mkdir(parents=True, exist_ok=True)
+        dev_cfg = dev_dir / "config.yaml"
+        dev_cfg.write_text("api_key: test-api-key-dev\n", encoding="utf-8")
+
+        monkeypatch.chdir(tmp_path)
+        found = Config.find_config_file("config.yaml")
+        assert found == root_cfg

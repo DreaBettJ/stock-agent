@@ -132,6 +132,12 @@ class Agent:
 
         # 初始化日志记录器
         self.logger = AgentLogger(enabled=enable_intercept_log, session_id=session_id)
+        self.session_id: int | None = None
+        if session_id is not None:
+            try:
+                self.session_id = int(str(session_id).strip())
+            except Exception:
+                self.session_id = None
 
         # ============================================================
         # Token 使用统计
@@ -641,7 +647,52 @@ Requirements:
             for tool_call in response.tool_calls:
                 tool_call_id = tool_call.id          # 工具调用 ID (用于关联结果)
                 function_name = tool_call.function.name  # 工具名称
-                arguments = tool_call.function.arguments  # 工具参数
+                arguments = dict(tool_call.function.arguments)  # 工具参数
+
+                # Runtime context binding:
+                # simulate_trade must always use current process/session context,
+                # never rely on model-guessed session_id.
+                if function_name == "simulate_trade":
+                    if self.session_id is None:
+                        result = ToolResult(
+                            success=False,
+                            content="",
+                            error="simulate_trade requires bound runtime session_id",
+                        )
+                        # Still write tool result/message below with unified path.
+                        self.logger.log_intercept_event(
+                            "after_tool",
+                            {
+                                "step": step + 1,
+                                "tool_call_id": tool_call_id,
+                                "tool_name": function_name,
+                                "success": result.success,
+                                "result_chars": 0,
+                                "error_chars": len(result.error or ""),
+                            },
+                        )
+                        self.logger.log_tool_result(
+                            tool_name=function_name,
+                            arguments=arguments,
+                            result_success=False,
+                            result_error=result.error,
+                        )
+                        logger.error("Tool error: %s", result.error)
+                        self.messages.append(
+                            Message(
+                                role="tool",
+                                content=f"Error: {result.error}",
+                                tool_call_id=tool_call_id,
+                                name=function_name,
+                            )
+                        )
+                        if self._check_cancelled():
+                            self._cleanup_incomplete_messages()
+                            cancel_msg = "Task cancelled by user."
+                            logger.warning(cancel_msg)
+                            return cancel_msg
+                        continue
+                    arguments["session_id"] = self.session_id
 
                 # 打印工具调用头部
                 logger.info("Tool call: %s", function_name)

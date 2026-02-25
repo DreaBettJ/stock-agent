@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,8 @@ class _SimTradeStore:
                     amount REAL,
                     fee REAL,
                     profit REAL,
+                    reason TEXT,
+                    price_source TEXT,
                     trade_date TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
@@ -62,6 +65,12 @@ class _SimTradeStore:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_trades_session ON sim_trades(session_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_positions_session ON sim_positions(session_id)")
+            cols = conn.execute("PRAGMA table_info(sim_trades)").fetchall()
+            col_names = {str(r["name"]) for r in cols}
+            if "reason" not in col_names:
+                conn.execute("ALTER TABLE sim_trades ADD COLUMN reason TEXT")
+            if "price_source" not in col_names:
+                conn.execute("ALTER TABLE sim_trades ADD COLUMN price_source TEXT")
             conn.commit()
 
     def get_position(self, session_id: int | str, ticker: str) -> sqlite3.Row | None:
@@ -101,15 +110,17 @@ class _SimTradeStore:
         amount: float,
         fee: float,
         profit: float | None,
+        reason: str | None,
+        price_source: str | None,
         trade_date: str,
     ) -> int:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO sim_trades (session_id, ticker, action, price, quantity, amount, fee, profit, trade_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO sim_trades (session_id, ticker, action, price, quantity, amount, fee, profit, reason, price_source, trade_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, ticker, action, price, quantity, amount, fee, profit, trade_date),
+                (session_id, ticker, action, price, quantity, amount, fee, profit, reason, price_source, trade_date),
             )
             conn.commit()
             return int(cursor.lastrowid)
@@ -146,6 +157,22 @@ class SimulateTradeTool(Tool):
             "and stamp duty 0.1% on sell."
         )
 
+    def _resolve_execution_price(self, symbol: str, trade_date: str) -> tuple[float, str]:
+        """Resolve execution price, preferring next-open then fallback to as-of close."""
+        try:
+            return self.kline_db.get_next_open_price(symbol, trade_date), "next_open"
+        except Exception:
+            return self.kline_db.get_price_on_or_before(symbol, trade_date), "asof_close"
+
+    @staticmethod
+    def _is_kechuang_ticker(symbol: str) -> bool:
+        return str(symbol or "").startswith("688")
+
+    @staticmethod
+    def _kechuang_buy_enabled() -> bool:
+        raw = str(os.getenv("MINI_AGENT_ENABLE_KECHUANG", "")).strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -162,25 +189,47 @@ class SimulateTradeTool(Tool):
                     "type": "string",
                     "description": "Reference date for execution price. Trade executes at next open.",
                 },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional execution reason for audit trail.",
+                },
             },
             "required": ["session_id", "action", "ticker", "quantity", "trade_date"],
         }
 
-    async def execute(self, session_id: int | str, action: str, ticker: str, quantity: int, trade_date: str) -> ToolResult:
+    async def execute(
+        self,
+        session_id: int | str,
+        action: str,
+        ticker: str,
+        quantity: int,
+        trade_date: str,
+        reason: str | None = None,
+    ) -> ToolResult:
         try:
             if quantity <= 0:
                 return ToolResult(success=False, content="", error="quantity must be > 0")
 
             session = self.session_manager.get_session(session_id)
-            if session.mode != "simulation":
-                return ToolResult(success=False, content="", error=f"session mode must be simulation, got {session.mode}")
+            if session.mode not in {"simulation", "backtest"}:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=f"session mode must be simulation/backtest, got {session.mode}",
+                )
 
             symbol = self.kline_db.normalize_ticker(ticker)
             action_normalized = action.strip().lower()
             
             # Buy/Sell both use next open price to avoid look-ahead bias in backtest.
             if action_normalized == "buy":
-                exec_price = self.kline_db.get_next_open_price(symbol, trade_date)
+                if self._is_kechuang_ticker(symbol) and not self._kechuang_buy_enabled():
+                    return ToolResult(
+                        success=False,
+                        content="",
+                        error="market access denied: kechuang buy requires MINI_AGENT_ENABLE_KECHUANG=1",
+                    )
+                exec_price, price_source = self._resolve_execution_price(symbol, trade_date)
                 gross_amount = exec_price * quantity
                 fee = gross_amount * self.COMMISSION_RATE
                 cash_delta = -(gross_amount + fee)
@@ -193,10 +242,10 @@ class SimulateTradeTool(Tool):
                 new_qty = old_qty + quantity
                 new_avg_cost = ((old_qty * old_cost) + gross_amount + fee) / new_qty
                 self.store.upsert_position(session_id, symbol, new_qty, new_avg_cost)
-                profit = None
+                profit = 0.0
 
             elif action_normalized == "sell":
-                exec_price = self.kline_db.get_next_open_price(symbol, trade_date)
+                exec_price, price_source = self._resolve_execution_price(symbol, trade_date)
                 gross_amount = exec_price * quantity
                 old_position = self.store.get_position(session_id, symbol)
                 if old_position is None or int(old_position["quantity"]) < quantity:
@@ -227,15 +276,20 @@ class SimulateTradeTool(Tool):
                 amount=gross_amount,
                 fee=fee,
                 profit=profit,
+                reason=(str(reason).strip() if reason else f"auto:{action_normalized}:{symbol}:{trade_date}"),
+                price_source=price_source,
                 trade_date=trade_date,
             )
 
             content = (
                 f"SIM_TRADE_OK id={trade_id} session={session_id} action={action_normalized} "
-                f"ticker={symbol} qty={quantity} price={exec_price:.3f} amount={gross_amount:.2f} fee={fee:.2f}"
+                f"ticker={symbol} qty={quantity} price={exec_price:.3f} amount={gross_amount:.2f} fee={fee:.2f} "
+                f"price_source={price_source}"
             )
             if profit is not None:
                 content += f" profit={profit:.2f}"
+            if reason:
+                content += f" reason={str(reason).strip()[:120]}"
             return ToolResult(success=True, content=content)
         except Exception as exc:
             return ToolResult(success=False, content="", error=f"simulate trade failed: {exc}")

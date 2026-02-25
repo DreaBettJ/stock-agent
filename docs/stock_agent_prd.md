@@ -8,6 +8,7 @@
 2. CLI 对话模式本身就是一个 session，和 `session/trade/backtest/event` 走同一套数据模型。
 3. 通过事件驱动触发 LLM 决策，并可自动执行模拟交易。
 4. 支持历史回测和日常同步 K 线数据。
+5. 工具链遵循“本地优先（local-first）”，先保证系统可运行，再逐步把关键数据能力内化到本地。
 
 ---
 
@@ -42,6 +43,24 @@
   - `mini_agent/tools/sim_trade_tool.py`
   - `mini_agent/tools/note_tool.py`
 
+### 2.6 数据与工具原则（Local-First）
+
+1. Tool 执行优先使用本地数据（SQLite / 本地缓存 / 本地计算），降低外部网络依赖。
+2. 数据按重要性分层，不要求“一次性全部本地化”：
+   - P0（关键）：交易执行、持仓、资金、事件、关键记忆、K线基础行情（必须本地可用）。
+   - P1（增强）：技术信号、主线/龙头分类、策略评分（优先本地计算，外部仅补充）。
+   - P2（可选）：新闻、舆情、题材扩展信息（可外部降级，不阻塞主流程）。
+3. 运行策略：先跑通主链路（可观测、可回放、可重试），再逐步替换为本地实现。
+
+### 2.5 自进化治理层（EVO-HIL）
+
+- 模块名：`EVO-HIL`（Evolution with Human-in-the-Loop）
+- 目标：对自动运行后的行为做“事后发现”，沉淀为可注入系统提示词的执行 `use case`。
+- 核心原则：
+  1. 低耦合：独立服务模块，不侵入交易执行核心链路。
+  2. 只产出提示词资产（use case prompt），不直接改交易规则代码。
+  3. LLM 智能总结优先，规则模板兜底。
+
 ---
 
 ## 3. 核心实体与约束
@@ -70,6 +89,10 @@ event_filter: list[str]
   - `daily_kline`
   - `sim_trades`
   - `sim_positions`
+  - `event_logs`
+  - `critical_memories`
+  - `evolution_use_cases`
+  - `reasoning_trace_events`（由 `agent_intercept_s*.jsonl` 同步得到的结构化推理链）
 
 说明：旧的多库设计（如 `stock_kline.db`）已收敛为单库。
 
@@ -91,6 +114,8 @@ event_filter: list[str]
 - `mini-agent event trigger <event_type> --session <id>`
   - 只触发单 session。
 - 事件触发默认走 LLM 决策并尝试执行模拟交易。
+- `mini-agent event trigger <event_type> --session <id> --debug`
+  - 调试模式：自动为事件生成唯一 `event_id`，跳过重复事件幂等拦截（用于重放/排查）。
 
 ### 4.3 模拟交易（trade）
 
@@ -111,6 +136,23 @@ event_filter: list[str]
 1. `sync` 先解决 K 线数据可用性问题。
 2. 支持指定股票或 `--all` 全市场。
 3. 支持 `--cron` 输出定时任务建议（收盘后同步 + 事件触发）。
+4. `sync --all` 在未显式传 `--start/--end` 时默认执行“当日增量同步”。
+5. `sync --all` 依赖 `config.yaml -> tools.tushare_token`；未配置时会直接报错并提示配置路径。
+
+### 4.6 自进化数据流（EVO-HIL）
+
+1. `scan` 阶段（发现问题/规律）
+   - 输入：`event_logs`（当前）及后续可扩展的 `sim_trades/sim_positions/critical_memories`。
+   - 处理：默认 LLM 生成 use case 提示词；失败时规则模板兜底。
+   - 输出：`evolution_use_cases`（`enabled=1`）。
+
+2. `inject` 阶段（运行时注入）
+   - 启动 `mini-agent` 时加载启用的 use case，拼接到系统提示词。
+   - 目标是让 Agent 直接吸收经验规律，减少重复犯错。
+
+3. `manage` 阶段（轻量治理）
+   - 通过 `enable/disable` 开关 use case，快速控制注入内容。
+   - 不直接修改交易引擎代码。
 
 ---
 
@@ -137,12 +179,21 @@ mini-agent backtest result --session <id>
 # Event
 mini-agent event trigger daily_review --session <id>
 mini-agent event trigger daily_review --all
-mini-agent event trigger daily_review --session <id>
+mini-agent event trigger daily_review --session <id> --debug   # 调试重放，跳过重复事件拦截
 
 # Sync
 mini-agent sync 600519,000001 --start 2020-01-01
-mini-agent sync --all --start 1991-01-01
+mini-agent sync --all                      # 默认当日增量
+mini-agent sync --all --start 2026-02-24 --end 2026-02-24
 mini-agent sync --cron
+
+# Evolve (EVO-HIL)
+mini-agent evolve scan --limit 200              # 默认 LLM 生成提案
+mini-agent evolve scan --no-llm --limit 200     # 规则模板兜底
+mini-agent evolve list --enabled on
+mini-agent evolve enable <use_case_id>
+mini-agent evolve disable <use_case_id>
+mini-agent evolve prompt --limit 12
 ```
 
 ---
@@ -161,3 +212,9 @@ mini-agent sync --cron
 2. 完善 `event_filter` 与事件类型治理。
 3. 增加 `sync` 定时任务落地脚本（systemd/cron 模板）。
 4. 回测结果持久化与对比查询（在不引入新子系统前提下）。
+5. EVO-HIL 接入 `alpha` 模式（基于收益归因生成策略型 use case）。
+6. 为 `evolution_use_cases` 增加更细粒度 source 映射（use_case -> event_log/trade ids）。
+7. Local-First 收敛计划：
+   - 第一步：把每日复盘关键信号全部切到本地 K 线计算（不依赖外网）。
+   - 第二步：为外部数据增加本地缓存与回退策略（失败不阻断交易主流程）。
+   - 第三步：逐步减少非关键外部 tool 在实时链路中的占比。

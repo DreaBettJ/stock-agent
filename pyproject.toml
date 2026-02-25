@@ -23,6 +23,7 @@ dependencies = [
     "openai>=1.57.4",
     "agent-client-protocol>=0.6.0",
     "akshare>=1.16.0",
+    "tushare>=1.4.24",
     "playwright>=1.52.0",
 ]
 

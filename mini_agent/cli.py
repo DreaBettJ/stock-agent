@@ -2,12 +2,13 @@
 Mini Agent - Interactive Runtime Example
 
 Usage:
-    mini-agent [--workspace DIR] [--task TASK]
+    mini-agent [--workspace DIR] [--task TASK] [--session-id ID]
 
 Examples:
     mini-agent                              # Use current directory as workspace (interactive mode)
     mini-agent --workspace /path/to/dir     # Use specific workspace directory (interactive mode)
     mini-agent --task "create a file"       # Execute a task non-interactively
+    mini-agent --session-id 8               # Attach to existing session 8
 """
 
 import argparse
@@ -16,13 +17,15 @@ import json
 import logging
 import os
 import platform
+import re
 import sqlite3
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -34,7 +37,14 @@ from prompt_toolkit.styles import Style
 from mini_agent import LLMClient
 from mini_agent.agent import Agent
 from mini_agent.app.decision_service import build_decision_runtime, run_llm_decision
-from mini_agent.app.memory_service import build_session_memory_snapshot, load_recent_session_memories
+from mini_agent.app.evolution_service import EvolutionUseCaseService
+from mini_agent.app.memory_service import (
+    build_session_memory_snapshot,
+    load_critical_session_memories,
+    load_recent_session_memories,
+)
+from mini_agent.app.prompt_guard import ensure_trade_policy_prompt
+from mini_agent.app.runtime_factory import build_runtime_session_context
 from mini_agent.app.sync_service import build_cron_lines, install_cron_lines, resolve_ticker_universe, sync_kline_data
 from mini_agent.config import Config
 from mini_agent.event_broadcaster import EventBroadcaster
@@ -340,23 +350,267 @@ async def _persist_turn_memory(
         logging.getLogger(__name__).exception("Memory persist exception (session=%s): %s", session_id, exc)
 
 
+def _load_prompt_memories(memory_db_path: Path, session_id: int, recent_limit: int = 12, critical_limit: int = 8) -> list[dict[str, str]]:
+    """Load prompt memories with critical memories first, then recent conversation memories."""
+    critical = load_critical_session_memories(memory_db_path, session_id=session_id, limit=critical_limit)
+    recent = load_recent_session_memories(memory_db_path, session_id=session_id, limit=recent_limit)
+    return [*critical, *recent]
+
+
+def _strategy_templates_path(workspace_dir: Path) -> Path:
+    candidate = workspace_dir / "docs" / "strategy_templates.md"
+    if candidate.exists():
+        return candidate
+    return Path(__file__).resolve().parent.parent / "docs" / "strategy_templates.md"
+
+
+def _load_strategy_templates(workspace_dir: Path) -> list[dict[str, str]]:
+    path = _strategy_templates_path(workspace_dir)
+    if not path.exists():
+        return []
+
+    text = path.read_text(encoding="utf-8")
+    templates: list[dict[str, str]] = []
+    current_id = ""
+    current_name = ""
+    buffer: list[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        m = re.match(r"^##\s+(\d+)\.\s+(.+?)\s*$", stripped)
+        if m:
+            if current_id and current_name:
+                templates.append(
+                    {
+                        "id": current_id,
+                        "name": current_name,
+                        "content": "\n".join(buffer).strip(),
+                    }
+                )
+            current_id = m.group(1)
+            current_name = m.group(2)
+            buffer = []
+            continue
+        # End current template when entering a non-template level-2 section.
+        if current_id and stripped.startswith("## "):
+            templates.append(
+                {
+                    "id": current_id,
+                    "name": current_name,
+                    "content": "\n".join(buffer).strip(),
+                }
+            )
+            current_id = ""
+            current_name = ""
+            buffer = []
+            continue
+        if current_id:
+            buffer.append(line)
+
+    if current_id and current_name:
+        templates.append(
+            {
+                "id": current_id,
+                "name": current_name,
+                "content": "\n".join(buffer).strip(),
+            }
+        )
+    return templates
+
+
+def _build_prompt_from_template(template: dict[str, str]) -> str:
+    name = str(template.get("name") or "策略模板").strip()
+    body = str(template.get("content") or "").strip()
+    if name == "自由策略":
+        return (
+            f"你是一个A股自动交易代理。\n\n"
+            f"当前策略模板：{name}\n\n"
+            f"{body}\n\n"
+            f"执行原则：\n"
+            f"- 你可以基于当下市场数据自主制定与调整策略。\n"
+            f"- 不预设固定买卖规则，由你自行判断是否交易与仓位分配。\n"
+            f"- 优先调用工具获取事实数据，再做可执行决策。"
+        )
+    return (
+        f"你是一个严格执行策略纪律的A股交易代理。\n\n"
+        f"当前策略模板：{name}\n\n"
+        f"{body}\n\n"
+        f"执行要求：\n"
+        f"- 交易信号必须可落地到工具调用。\n"
+        f"- 决策必须包含仓位、止损、止盈、风险提示。\n"
+        f"- 参数缺失时先澄清，不允许凭空猜测。"
+    )
+
+
+def _pick_strategy_template(templates: list[dict[str, str]], selector: str) -> dict[str, str] | None:
+    key = (selector or "").strip()
+    if not key:
+        return None
+    for item in templates:
+        if key == str(item.get("id")):
+            return item
+    for item in templates:
+        if key == str(item.get("name")):
+            return item
+    return None
+
+
+def _pick_default_conservative_template(templates: list[dict[str, str]]) -> dict[str, str] | None:
+    """Pick conservative default template, prefer 高股息策略 then 龙头股趋势策略."""
+    preferred_names = ("高股息策略", "龙头股趋势策略")
+    for name in preferred_names:
+        matched = _pick_strategy_template(templates, name)
+        if matched is not None:
+            return matched
+    # Fallback by id when current template library keeps high-dividend as #6.
+    matched = _pick_strategy_template(templates, "6")
+    if matched is not None:
+        return matched
+    return templates[0] if templates else None
+
+
+def _prompt_with_default(label: str, default: str | None = None, input_func=input) -> str:
+    prompt = f"{label}"
+    if default is not None and str(default).strip():
+        prompt += f" [{default}]"
+    prompt += ": "
+    raw = input_func(prompt).strip()
+    return raw if raw else str(default or "")
+
+
+def _collect_session_create_inputs(args: argparse.Namespace, workspace_dir: Path, input_func=input) -> dict[str, Any]:
+    """Collect session create parameters from args + interactive prompts."""
+    interactive = sys.stdin.isatty()
+    templates = _load_strategy_templates(workspace_dir)
+
+    name = args.name
+    mode = args.mode or "simulation"
+    initial_capital = args.initial_capital
+    risk_preference = args.risk_preference or "low"
+    max_single_loss_pct = args.max_single_loss_pct
+    single_position_cap_pct = args.single_position_cap_pct
+    stop_loss_pct = args.stop_loss_pct
+    take_profit_pct = args.take_profit_pct
+    investment_horizon = args.investment_horizon or "中线"
+    event_filter = args.event_filter or []
+    prompt = args.prompt
+    template_selector = args.template
+
+    if interactive:
+        if not name:
+            name = _prompt_with_default("Session 名称", datetime.now().strftime("strategy-%Y%m%d-%H%M%S"), input_func)
+        if not mode:
+            mode = _prompt_with_default("模式 (simulation/backtest)", "simulation", input_func)
+        if initial_capital is None:
+            initial_capital = float(_prompt_with_default("初始资金", "1000000", input_func))
+        if not template_selector and not prompt and templates:
+            print("可用策略模板:")
+            for item in templates:
+                print(f"  {item['id']}. {item['name']}")
+            default_template = _pick_default_conservative_template(templates)
+            default_selector = str(default_template["id"]) if default_template else ""
+            template_selector = _prompt_with_default("选择模板编号(回车默认保守策略)", default_selector, input_func)
+        if not prompt and template_selector:
+            picked = _pick_strategy_template(templates, str(template_selector))
+            if picked:
+                prompt = _build_prompt_from_template(picked)
+                print(f"{Colors.GREEN}✅ Selected strategy template: {picked['id']}. {picked['name']}{Colors.RESET}")
+        if not prompt and templates:
+            picked = _pick_default_conservative_template(templates)
+            if picked:
+                prompt = _build_prompt_from_template(picked)
+                print(f"{Colors.GREEN}✅ Selected default conservative template: {picked['id']}. {picked['name']}{Colors.RESET}")
+        if not prompt:
+            prompt = _prompt_with_default("系统提示词", "", input_func)
+        if not risk_preference:
+            risk_preference = _prompt_with_default("风险偏好(low/medium/high)", "low", input_func)
+        if max_single_loss_pct is None:
+            max_single_loss_pct = float(_prompt_with_default("最大单笔亏损(%)", "1.5", input_func))
+        if single_position_cap_pct is None:
+            single_position_cap_pct = float(_prompt_with_default("单票仓位上限(%)", "15", input_func))
+        if stop_loss_pct is None:
+            stop_loss_pct = float(_prompt_with_default("止损线(%)", "6", input_func))
+        if take_profit_pct is None:
+            take_profit_pct = float(_prompt_with_default("止盈线(%)", "12", input_func))
+        if not investment_horizon:
+            investment_horizon = _prompt_with_default("投资周期", "中线", input_func)
+    else:
+        if not name:
+            name = datetime.now().strftime("strategy-%Y%m%d-%H%M%S")
+        if initial_capital is None:
+            initial_capital = 1000000.0
+        if max_single_loss_pct is None:
+            max_single_loss_pct = 1.5
+        if single_position_cap_pct is None:
+            single_position_cap_pct = 15.0
+        if stop_loss_pct is None:
+            stop_loss_pct = 6.0
+        if take_profit_pct is None:
+            take_profit_pct = 12.0
+        # non-interactive mode: prompt/template still required (or use default conservative template if available)
+        missing = []
+        if not prompt and not template_selector:
+            picked_default = _pick_default_conservative_template(templates)
+            if picked_default is not None:
+                prompt = _build_prompt_from_template(picked_default)
+            else:
+                missing.append("--prompt/--template")
+        if missing:
+            raise ValueError(f"Non-interactive create missing required args: {', '.join(missing)}")
+        if not prompt and template_selector:
+            picked = _pick_strategy_template(templates, str(template_selector))
+            if not picked:
+                raise ValueError(f"Template not found: {template_selector}")
+            prompt = _build_prompt_from_template(picked)
+
+    if not prompt:
+        raise ValueError("system prompt is required")
+
+    return {
+        "name": str(name).strip(),
+        "system_prompt": str(prompt),
+        "mode": str(mode).strip().lower(),
+        "initial_capital": float(initial_capital),
+        "risk_preference": str(risk_preference).strip().lower(),
+        "max_single_loss_pct": float(max_single_loss_pct),
+        "single_position_cap_pct": float(single_position_cap_pct),
+        "stop_loss_pct": float(stop_loss_pct),
+        "take_profit_pct": float(take_profit_pct),
+        "investment_horizon": str(investment_horizon).strip() or "中线",
+        "event_filter": event_filter,
+    }
+
+
 def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle session subcommands."""
     manager = SessionManager(db_path=str(get_memory_db_path(workspace_dir)))
 
     if args.session_command == "create":
+        payload = _collect_session_create_inputs(args, workspace_dir)
         session_id = manager.create_session(
-            name=args.name,
-            system_prompt=args.prompt,
-            mode=args.mode,
-            initial_capital=args.initial_capital,
-            event_filter=args.event_filter or [],
+            name=payload["name"],
+            system_prompt=payload["system_prompt"],
+            mode=payload["mode"],
+            initial_capital=payload["initial_capital"],
+            risk_preference=payload["risk_preference"],
+            max_single_loss_pct=payload["max_single_loss_pct"],
+            single_position_cap_pct=payload["single_position_cap_pct"],
+            stop_loss_pct=payload["stop_loss_pct"],
+            take_profit_pct=payload["take_profit_pct"],
+            investment_horizon=payload["investment_horizon"],
+            event_filter=payload["event_filter"],
         )
         print(f"{Colors.GREEN}✅ Session created{Colors.RESET}")
         print(f"session_id: {session_id}")
-        print(f"name: {args.name}")
-        print(f"mode: {args.mode}")
-        print(f"initial_capital: {args.initial_capital:.2f}")
+        print(f"name: {payload['name']}")
+        print(f"mode: {payload['mode']}")
+        print(f"initial_capital: {payload['initial_capital']:.2f}")
+        print(f"risk_preference: {payload['risk_preference']}")
+        print(f"max_single_loss_pct: {payload['max_single_loss_pct']:.2f}")
+        print(f"single_position_cap_pct: {payload['single_position_cap_pct']:.2f}")
+        print(f"stop_loss_pct: {payload['stop_loss_pct']:.2f}")
+        print(f"take_profit_pct: {payload['take_profit_pct']:.2f}")
+        print(f"investment_horizon: {payload['investment_horizon']}")
         return
 
     if args.session_command == "list":
@@ -364,10 +618,13 @@ def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> Non
         if not sessions:
             print(f"{Colors.YELLOW}No sessions found.{Colors.RESET}")
             return
+        online_session_ids = set(manager.list_online_session_ids())
         print("session_id\tname\tmode\tstatus\tlistening")
         for session in sessions:
-            listening = "yes" if session.is_listening else "no"
-            print(f"{session.session_id}\t{session.name}\t{session.mode}\t{session.status}\t{listening}")
+            is_online = session.session_id in online_session_ids
+            status = "running" if is_online else "stopped"
+            listening = "yes" if is_online else "no"
+            print(f"{session.session_id}\t{session.name}\t{session.mode}\t{status}\t{listening}")
         return
 
     try:
@@ -377,10 +634,42 @@ def handle_session_command(args: argparse.Namespace, workspace_dir: Path) -> Non
         elif args.session_command == "stop":
             manager.stop_session(args.session_id)
             print(f"{Colors.GREEN}✅ Session stopped: {args.session_id}{Colors.RESET}")
+        elif args.session_command == "update":
+            updated = False
+            if args.prompt is not None:
+                manager.update_system_prompt(args.session_id, args.prompt)
+                updated = True
+            manager.update_risk_profile(
+                args.session_id,
+                risk_preference=args.risk_preference,
+                max_single_loss_pct=args.max_single_loss_pct,
+                single_position_cap_pct=args.single_position_cap_pct,
+                stop_loss_pct=args.stop_loss_pct,
+                take_profit_pct=args.take_profit_pct,
+                investment_horizon=args.investment_horizon,
+            )
+            if any(
+                value is not None
+                for value in (
+                    args.risk_preference,
+                    args.max_single_loss_pct,
+                    args.single_position_cap_pct,
+                    args.stop_loss_pct,
+                    args.take_profit_pct,
+                    args.investment_horizon,
+                )
+            ):
+                updated = True
+            if not updated:
+                print(f"{Colors.YELLOW}⚠️ No fields provided. Nothing updated.{Colors.RESET}")
+                return
+            print(f"{Colors.GREEN}✅ Session updated: {args.session_id}{Colors.RESET}")
         elif args.session_command == "delete":
             manager.delete_session(args.session_id)
             print(f"{Colors.GREEN}✅ Session deleted: {args.session_id}{Colors.RESET}")
     except KeyError as exc:
+        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
+    except ValueError as exc:
         print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
 
 
@@ -413,6 +702,107 @@ def _read_realized_profit(db_path: Path, session_id: str) -> float:
         except sqlite3.OperationalError:
             return 0.0
     return float(row["realized"] if row else 0.0)
+
+
+def _resolve_trade_date_for_execution(memory_db_path: Path) -> str:
+    """Prefer latest available kline date for deterministic simulation execution."""
+    with sqlite3.connect(memory_db_path) as conn:
+        row = conn.execute("SELECT MAX(date) AS d FROM daily_kline").fetchone()
+    if row and row[0]:
+        return str(row[0])
+    return datetime.now().date().isoformat()
+
+
+def _parse_direct_trade_order(user_input: str) -> dict | None:
+    """Parse explicit natural-language buy/sell instruction from user input."""
+    text = (user_input or "").strip()
+    if not text:
+        return None
+
+    buy_keywords = ("买入", "购买", "买")
+    sell_keywords = ("卖出", "卖", "减仓")
+    action = None
+    if any(k in text for k in buy_keywords):
+        action = "buy"
+    elif any(k in text for k in sell_keywords):
+        action = "sell"
+    if action is None:
+        return None
+
+    qty_match = re.search(r"(\d+)\s*股", text)
+    if not qty_match:
+        return None
+    quantity = int(qty_match.group(1))
+    if quantity <= 0:
+        return None
+
+    ticker_match = re.search(r"\b(\d{6})(?:\.(?:SH|SZ))?\b", text, flags=re.IGNORECASE)
+    ticker = ticker_match.group(1) if ticker_match else ""
+    if not ticker:
+        alias_map = {
+            "贵州茅台": "600519",
+            "茅台": "600519",
+            "平安银行": "000001",
+            "中国平安": "601318",
+            "宁德时代": "300750",
+        }
+        for alias, code in alias_map.items():
+            if alias in text:
+                ticker = code
+                break
+
+    if not ticker:
+        return None
+    date_match = re.search(r"(20\d{2}-\d{2}-\d{2})", text)
+    trade_date = date_match.group(1) if date_match else None
+
+    return {"action": action, "ticker": ticker, "quantity": quantity, "trade_date": trade_date}
+
+
+def _parse_sim_trade_tool_content(content: str) -> dict[str, Any]:
+    """Parse simulate_trade tool output text into structured fields."""
+    text = str(content or "").strip()
+    pairs = dict(re.findall(r"([a-zA-Z_]+)=([^\s]+)", text))
+    action = str(pairs.get("action") or "").strip().lower() or None
+    ticker = str(pairs.get("ticker") or "").strip() or None
+    quantity_raw = str(pairs.get("qty") or "").strip()
+    quantity = int(quantity_raw) if quantity_raw.isdigit() else None
+    return {
+        "raw": text,
+        "action": action,
+        "ticker": ticker,
+        "quantity": quantity,
+        "price_source": pairs.get("price_source"),
+    }
+
+
+def _record_sim_trade_critical_from_messages(
+    *,
+    session_manager: SessionManager,
+    session_id: int,
+    messages: list[Any],
+    event_type: str,
+    event_id: str | None = None,
+) -> None:
+    """Persist critical memories for simulate_trade tool calls in a message slice."""
+    for msg in messages:
+        if msg.role != "tool" or str(msg.name or "") != "simulate_trade":
+            continue
+        parsed = _parse_sim_trade_tool_content(str(msg.content or ""))
+        raw = str(parsed.get("raw") or "")
+        if "SIM_TRADE_OK" in raw:
+            op = str(parsed.get("action") or "trade")
+        else:
+            action = str(parsed.get("action") or "").strip()
+            op = f"{action}_failed" if action else "trade_failed"
+        session_manager.record_critical_memory(
+            session_id=session_id,
+            event_id=(event_id or None),
+            event_type=event_type,
+            operation=op,
+            reason="simulate_trade_tool",
+            content=json.dumps(parsed, ensure_ascii=False),
+        )
 
 
 def handle_trade_command(args: argparse.Namespace, workspace_dir: Path) -> None:
@@ -495,6 +885,21 @@ def handle_trade_command(args: argparse.Namespace, workspace_dir: Path) -> None:
                 f"{Colors.YELLOW}⚠️ Missing latest price for: {', '.join(missing_prices)}; "
                 f"their unrealized pnl is excluded.{Colors.RESET}"
             )
+        return
+
+    if args.trade_command == "action-logs":
+        rows = trade_tool.session_manager.list_trade_action_logs(args.session_id, limit=int(args.limit))
+        if not rows:
+            print("No trade action logs.")
+            return
+        print("id\tevent_id\taction\tticker\tqty\tdate\tstatus\terror_code\treason")
+        for row in rows:
+            print(
+                f"{row.get('id')}\t{row.get('event_id') or ''}\t{row.get('action') or ''}\t"
+                f"{row.get('ticker') or ''}\t{row.get('quantity') or ''}\t{row.get('trade_date') or ''}\t"
+                f"{row.get('status') or ''}\t{row.get('error_code') or ''}\t{row.get('reason') or ''}"
+            )
+        return
 
 
 async def _default_event_trigger(session, event: dict) -> str:
@@ -505,18 +910,20 @@ async def _default_event_trigger(session, event: dict) -> str:
 def _build_event_from_args(args: argparse.Namespace) -> dict:
     """Build normalized event payload from CLI args."""
     event = {"type": args.event_type, "triggered_at": datetime.now().isoformat()}
-    if not args.payload:
-        return event
+    if args.payload:
+        try:
+            payload = json.loads(args.payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON payload: {exc}") from exc
 
-    try:
-        payload = json.loads(args.payload)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON payload: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("--payload must be a JSON object")
 
-    if not isinstance(payload, dict):
-        raise ValueError("--payload must be a JSON object")
-
-    event.update(payload)
+        event.update(payload)
+    if "date" not in event:
+        event["date"] = datetime.now().date().isoformat()
+    if "event_id" not in event or not str(event.get("event_id")).strip():
+        event["event_id"] = f"{event.get('type')}:{event.get('date')}"
     return event
 
 
@@ -534,7 +941,14 @@ def _match_single_session_for_event(session, event_type: str | None) -> tuple[bo
 async def _run_auto_event_for_sessions(runtime, session_ids: list[int], trading_date: str) -> list[dict]:
     """Run auto decision for multiple sessions concurrently."""
     tasks = [
-        asyncio.create_task(run_llm_decision(runtime=runtime, session_id=session_id, trading_date=trading_date))
+        asyncio.create_task(
+            run_llm_decision(
+                runtime=runtime,
+                session_id=session_id,
+                trading_date=trading_date,
+                event_id=f"daily_review:{trading_date}",
+            )
+        )
         for session_id in session_ids
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -563,6 +977,7 @@ def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> No
             runtime=runtime,
             session_id=session.session_id,
             trading_date=str(event.get("date") or ""),
+            event_id=str(event.get("event_id") or "") or None,
         )
         if result.get("execution_error"):
             return f"LLM_DECISION_FAIL {result['execution_error']}"
@@ -616,6 +1031,31 @@ def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> No
         print(f"Profit Factor:{perf.get('profit_factor', 0):.2f}")
         print(f"{'='*40}")
 
+        if getattr(args, "gate", False):
+            gate_failures: list[str] = []
+            total_trades = int(perf.get("total_trades", 0) or 0)
+            win_rate = float(perf.get("win_rate", 0.0) or 0.0)
+            max_drawdown = float(perf.get("max_drawdown", 0.0) or 0.0)
+            profit_factor = float(perf.get("profit_factor", 0.0) or 0.0)
+
+            if total_trades < int(args.gate_min_trades):
+                gate_failures.append(f"total_trades {total_trades} < {int(args.gate_min_trades)}")
+            if win_rate < float(args.gate_min_win_rate):
+                gate_failures.append(f"win_rate {win_rate:.3f} < {float(args.gate_min_win_rate):.3f}")
+            if max_drawdown > float(args.gate_max_drawdown):
+                gate_failures.append(f"max_drawdown {max_drawdown:.3f} > {float(args.gate_max_drawdown):.3f}")
+            if profit_factor < float(args.gate_min_profit_factor):
+                gate_failures.append(
+                    f"profit_factor {profit_factor:.3f} < {float(args.gate_min_profit_factor):.3f}"
+                )
+
+            if gate_failures:
+                print(f"{Colors.RED}❌ Backtest gate failed{Colors.RESET}")
+                for line in gate_failures:
+                    print(f"- {line}")
+                raise SystemExit(2)
+            print(f"{Colors.GREEN}✅ Backtest gate passed{Colors.RESET}")
+
     elif args.backtest_command == "result":
         # Show stored backtest result
         print(f"{Colors.CYAN}Backtest result for session: {args.session}{Colors.RESET}")
@@ -643,73 +1083,134 @@ def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     except ValueError as exc:
         print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
         return
+    if getattr(args, "debug", False):
+        base_event_id = str(event.get("event_id") or f"{event.get('type')}:{event.get('date')}")
+        nonce = uuid.uuid4().hex[:8]
+        event["event_id"] = f"{base_event_id}:debug:{datetime.now().strftime('%Y%m%d%H%M%S')}{nonce}"
+        print(f"{Colors.YELLOW}⚠️ debug mode enabled: idempotency bypass via unique event_id{Colors.RESET}")
 
-    event_type = str(event.get("type") or "").strip() or None
     manager = SessionManager(db_path=str(get_memory_db_path(workspace_dir)))
     if args.all_sessions:
-        target_sessions = manager.broadcast_event(event)
+        target_session_ids = manager.list_online_session_ids()
     else:
         try:
-            session = manager.get_session(args.session_id)
+            manager.get_session(args.session_id)
         except KeyError as exc:
             print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
             return
-
-        matched, reason = _match_single_session_for_event(session, event_type)
-        if not matched:
+        if not manager.is_session_online(args.session_id):
             print(f"event_type: {event.get('type')}")
             print(f"session: {args.session_id}")
-            print(f"{Colors.YELLOW}⚠️ skipped: {reason}{Colors.RESET}")
+            print(f"{Colors.YELLOW}⚠️ skipped: session runtime is offline{Colors.RESET}")
             return
-        target_sessions = [session]
+        target_session_ids = [int(args.session_id)]
 
     print(f"event_type: {event.get('type')}")
-    print(f"matched_sessions: {len(target_sessions)}")
-    if not target_sessions:
-        print(f"{Colors.YELLOW}⚠️ No listening sessions matched this event.{Colors.RESET}")
+    print(f"target_sessions: {len(target_session_ids)}")
+    if not target_session_ids:
+        print(f"{Colors.YELLOW}⚠️ No online session runtimes found.{Colors.RESET}")
         return
 
-    print(f"{Colors.CYAN}🤖 Auto trading mode (default){Colors.RESET}")
-    try:
-        runtime = build_decision_runtime(workspace_dir, get_memory_db_path(workspace_dir))
-    except FileNotFoundError as exc:
-        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
-        return
-
-    trading_date = str(event.get("date") or datetime.now().date().isoformat())
-    session_ids = [session.session_id for session in target_sessions]
-    auto_records = asyncio.run(_run_auto_event_for_sessions(runtime, session_ids, trading_date))
-    for item in auto_records:
-        sid = item["session_id"]
-        if not item.get("success"):
-            error_message = item.get("error", "unknown error")
-            manager.record_event_result(
-                session_id=sid,
-                event=event,
-                success=False,
-                error=error_message,
-            )
-            print(f"- {sid}: failed {error_message}")
-            continue
-
-        result = item["result"]
-        signal = result.get("trade_signal")
-        if signal:
-            summary = f"{signal['action']} {signal['ticker']} x{signal['quantity']}"
+    queued = 0
+    duplicated = 0
+    for sid in target_session_ids:
+        inserted, event_id = manager.enqueue_event(sid, event)
+        if inserted:
+            queued += 1
+            print(f"- {sid}: queued event_id={event_id}")
         else:
-            summary = "no_trade"
+            duplicated += 1
+            print(f"- {sid}: duplicate event_id={event_id} (ignored)")
 
-        execution = result.get("execution")
-        execution_error = result.get("execution_error")
-        detail = execution if execution else execution_error if execution_error else summary
-        manager.record_event_result(
-            session_id=sid,
-            event=event,
-            success=execution_error is None,
-            result=detail,
-            error=execution_error,
+    print(f"queued={queued}, duplicate={duplicated}")
+
+
+def handle_evolve_command(args: argparse.Namespace, workspace_dir: Path) -> None:
+    """Handle low-coupling evolution use-case commands."""
+    service = EvolutionUseCaseService(db_path=str(get_memory_db_path(workspace_dir)))
+    cmd = args.evolve_command
+    if cmd == "scan":
+        records: list[dict[str, Any]] = []
+        if args.use_llm:
+            try:
+                cfg = Config.from_yaml(Config.get_default_config_path())
+                llm = LLMClient(
+                    api_key=cfg.llm.api_key,
+                    provider=LLMProvider(cfg.llm.provider),
+                    api_base=cfg.llm.api_base,
+                    model=cfg.llm.model,
+                    retry_config=cfg.llm.retry,
+                )
+                records = asyncio.run(service.generate_use_cases_with_llm(llm, limit=args.limit))
+            except Exception as exc:
+                print(f"{Colors.YELLOW}⚠️ LLM use-case generation failed, fallback to rule templates: {exc}{Colors.RESET}")
+                records = []
+        if not records:
+            records = service.generate_use_cases_with_rules(limit=args.limit)
+        if not records:
+            print(f"{Colors.YELLOW}No new use cases generated.{Colors.RESET}")
+            return
+        print(f"{Colors.GREEN}Generated use cases: {len(records)}{Colors.RESET}")
+        for item in records:
+            print(
+                f"- {item['use_case_id']}\tissue={item['issue_type']}\tcount={item['count']}\t{item['title']}"
+            )
+        return
+
+    if cmd == "trace-sync":
+        result = service.ingest_all_intercept_logs(session_id=args.session_id)
+        print(
+            f"{Colors.GREEN}trace synced: files={result['files']} inserted={result['inserted']} skipped={result['skipped']} errors={result['errors']}{Colors.RESET}"
         )
-        print(f"- {sid}: ok {summary} | {detail}")
+        return
+
+    if cmd == "trace-summary":
+        summary = service.trace_summary(session_id=args.session_id, limit=args.limit)
+        print(f"total_rows: {summary['total_rows']}")
+        print("events:")
+        for row in summary["events"]:
+            print(f"- {row['event']}: {row['cnt']}")
+        print("tool_failures:")
+        for row in summary["tool_failures"]:
+            print(f"- {row.get('tool_name') or 'unknown'}: {row['fail_count']}")
+        return
+
+    if cmd == "list":
+        enabled_filter = None
+        if args.enabled == "on":
+            enabled_filter = 1
+        elif args.enabled == "off":
+            enabled_filter = 0
+        rows = service.list_use_cases(enabled=enabled_filter, limit=args.limit)
+        if not rows:
+            print(f"{Colors.YELLOW}No use cases found.{Colors.RESET}")
+            return
+        print("use_case_id\tenabled\tissue_type\ttitle")
+        for row in rows:
+            print(
+                f"{row['use_case_id']}\t{('on' if int(row['enabled']) == 1 else 'off')}\t{row['issue_type']}\t{row['title']}"
+            )
+        return
+
+    try:
+        if cmd == "enable":
+            service.set_use_case_enabled(args.use_case_id, True)
+            print(f"{Colors.GREEN}✅ Enabled use_case: {args.use_case_id}{Colors.RESET}")
+            return
+        if cmd == "disable":
+            service.set_use_case_enabled(args.use_case_id, False)
+            print(f"{Colors.GREEN}✅ Disabled use_case: {args.use_case_id}{Colors.RESET}")
+            return
+        if cmd == "prompt":
+            block = service.render_prompt_block(limit=args.limit)
+            if not block:
+                print(f"{Colors.YELLOW}No enabled use cases for prompt injection.{Colors.RESET}")
+                return
+            print("[Execution Use Cases]")
+            print(block)
+            return
+    except (KeyError, ValueError) as exc:
+        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -747,6 +1248,12 @@ Examples:
         help="Execute a task non-interactively and exit",
     )
     parser.add_argument(
+        "--session-id",
+        type=int,
+        default=None,
+        help="Attach to an existing session ID instead of creating a new runtime session",
+    )
+    parser.add_argument(
         "--version",
         "-v",
         action="version",
@@ -770,11 +1277,17 @@ Examples:
     session_subparsers = session_parser.add_subparsers(dest="session_command", help="Session actions")
 
     session_create = session_subparsers.add_parser("create", help="Create a session")
-    session_create.add_argument("--name", required=True, help="Session name")
-    session_create.add_argument("--prompt", required=True, help="System prompt")
+    session_create.add_argument("--name", required=False, default=None, help="Session name (interactive if omitted)")
+    session_create.add_argument("--prompt", required=False, default=None, help="System prompt (interactive if omitted)")
+    session_create.add_argument(
+        "--template",
+        required=False,
+        default=None,
+        help="Strategy template id/name from docs/strategy_templates.md",
+    )
     session_create.add_argument(
         "--mode",
-        default="simulation",
+        default=None,
         choices=["simulation", "backtest"],
         help="Session mode",
     )
@@ -783,14 +1296,49 @@ Examples:
         "--capital",
         dest="initial_capital",
         type=float,
-        default=100000.0,
-        help="Initial capital",
+        default=None,
+        help="Initial capital (interactive if omitted)",
     )
     session_create.add_argument(
         "--event-filter",
         nargs="*",
         default=[],
         help="Optional event types this session listens to",
+    )
+    session_create.add_argument(
+        "--risk-preference",
+        choices=["low", "medium", "high"],
+        default=None,
+        help="Session risk preference (interactive if omitted)",
+    )
+    session_create.add_argument(
+        "--max-single-loss-pct",
+        type=float,
+        default=None,
+        help="Max single trade loss percent (interactive if omitted)",
+    )
+    session_create.add_argument(
+        "--single-position-cap-pct",
+        type=float,
+        default=None,
+        help="Single position cap percent (interactive if omitted)",
+    )
+    session_create.add_argument(
+        "--stop-loss-pct",
+        type=float,
+        default=None,
+        help="Stop loss percent (interactive if omitted)",
+    )
+    session_create.add_argument(
+        "--take-profit-pct",
+        type=float,
+        default=None,
+        help="Take profit percent (interactive if omitted)",
+    )
+    session_create.add_argument(
+        "--investment-horizon",
+        default=None,
+        help="Investment horizon label, e.g. 短线/中线/长线 (interactive if omitted)",
     )
 
     session_subparsers.add_parser("list", help="List sessions")
@@ -800,6 +1348,21 @@ Examples:
 
     session_stop = session_subparsers.add_parser("stop", help="Stop one session")
     session_stop.add_argument("session_id", type=int, help="Session ID")
+
+    session_update = session_subparsers.add_parser("update", help="Update session prompt/risk profile")
+    session_update.add_argument("session_id", type=int, help="Session ID")
+    session_update.add_argument("--prompt", default=None, help="New system prompt (optional)")
+    session_update.add_argument(
+        "--risk-preference",
+        choices=["low", "medium", "high"],
+        default=None,
+        help="Session risk preference",
+    )
+    session_update.add_argument("--max-single-loss-pct", type=float, default=None, help="Max single trade loss percent")
+    session_update.add_argument("--single-position-cap-pct", type=float, default=None, help="Single position cap percent")
+    session_update.add_argument("--stop-loss-pct", type=float, default=None, help="Stop loss percent")
+    session_update.add_argument("--take-profit-pct", type=float, default=None, help="Take profit percent")
+    session_update.add_argument("--investment-horizon", default=None, help="Investment horizon label")
 
     session_delete = session_subparsers.add_parser("delete", help="Delete one session")
     session_delete.add_argument("session_id", type=int, help="Session ID")
@@ -836,6 +1399,10 @@ Examples:
     trade_profit = trade_subparsers.add_parser("profit", help="Show profit summary")
     trade_profit.add_argument("--session", required=True, dest="session_id", type=int, help="Session ID")
 
+    trade_action_logs = trade_subparsers.add_parser("action-logs", help="Show trade action execution logs")
+    trade_action_logs.add_argument("--session", required=True, dest="session_id", type=int, help="Session ID")
+    trade_action_logs.add_argument("--limit", type=int, default=20, help="Max rows to show")
+
     # backtest subcommands
     backtest_parser = subparsers.add_parser("backtest", help="Backtest commands")
     backtest_subparsers = backtest_parser.add_subparsers(dest="backtest_command", help="Backtest actions")
@@ -850,6 +1417,11 @@ Examples:
         action="store_true",
         help="Run backtest with mock decision (no external LLM call, for fast local verification)",
     )
+    backtest_run.add_argument("--gate", action="store_true", help="Enable quality gate check after backtest")
+    backtest_run.add_argument("--gate-min-trades", type=int, default=1, help="Gate: minimum total trades")
+    backtest_run.add_argument("--gate-min-win-rate", type=float, default=0.30, help="Gate: minimum win rate (0~1)")
+    backtest_run.add_argument("--gate-max-drawdown", type=float, default=0.35, help="Gate: maximum drawdown (0~1)")
+    backtest_run.add_argument("--gate-min-profit-factor", type=float, default=0.8, help="Gate: minimum profit factor")
 
     backtest_result = backtest_subparsers.add_parser("result", help="Show backtest result")
     backtest_result.add_argument("--session", required=True, type=int, help="Session ID")
@@ -861,9 +1433,10 @@ Examples:
     event_trigger = event_subparsers.add_parser("trigger", help="Trigger one event")
     event_trigger.add_argument("event_type", help="Event type, e.g. daily_review")
     target_group = event_trigger.add_mutually_exclusive_group(required=True)
-    target_group.add_argument("--all", action="store_true", dest="all_sessions", help="Trigger all listening sessions")
-    target_group.add_argument("--session", dest="session_id", type=int, help="Trigger a specific session")
+    target_group.add_argument("--all", action="store_true", dest="all_sessions", help="Enqueue to all online CLI sessions")
+    target_group.add_argument("--session", dest="session_id", type=int, help="Enqueue to one online session")
     event_trigger.add_argument("--payload", default=None, help="Optional JSON payload object")
+    event_trigger.add_argument("--debug", action="store_true", help="Debug mode: bypass duplicate check by forcing unique event_id")
 
     # health check command
     health_parser = subparsers.add_parser("health", help="Health check commands")
@@ -878,6 +1451,46 @@ Examples:
     sync_parser.add_argument("--end", default=None, help="End date YYYY-MM-DD (default: today)")
     sync_parser.add_argument("--cron", action="store_true", help="Print recommended crontab entries")
     sync_parser.add_argument("--install-cron", action="store_true", help="Install/update recommended crontab entries")
+
+    # evolve command
+    evolve_parser = subparsers.add_parser("evolve", help="Execution use-case prompt management")
+    evolve_subparsers = evolve_parser.add_subparsers(dest="evolve_command", help="Evolution actions")
+
+    evolve_scan = evolve_subparsers.add_parser("scan", help="Scan runtime data and generate execution use cases")
+    evolve_scan.add_argument("--limit", type=int, default=200, help="Scan recent failed event logs")
+    evolve_scan.add_argument("--llm", dest="use_llm", action="store_true", help="Use LLM to generate intelligent proposals")
+    evolve_scan.add_argument(
+        "--no-llm",
+        dest="use_llm",
+        action="store_false",
+        help="Disable LLM generation and use rule templates only",
+    )
+    evolve_scan.set_defaults(use_llm=True)
+
+    evolve_list = evolve_subparsers.add_parser("list", help="List use cases")
+    evolve_list.add_argument(
+        "--enabled",
+        default=None,
+        choices=["on", "off"],
+        help="Optional enabled filter",
+    )
+    evolve_list.add_argument("--limit", type=int, default=50, help="Maximum use cases to list")
+
+    evolve_enable = evolve_subparsers.add_parser("enable", help="Enable one use case")
+    evolve_enable.add_argument("use_case_id", help="Use case ID")
+
+    evolve_disable = evolve_subparsers.add_parser("disable", help="Disable one use case")
+    evolve_disable.add_argument("use_case_id", help="Use case ID")
+
+    evolve_prompt = evolve_subparsers.add_parser("prompt", help="Render enabled use cases as one prompt block")
+    evolve_prompt.add_argument("--limit", type=int, default=12, help="Maximum enabled use cases in prompt block")
+
+    evolve_trace_sync = evolve_subparsers.add_parser("trace-sync", help="Ingest intercept JSONL into structured reasoning traces")
+    evolve_trace_sync.add_argument("--session-id", type=int, default=None, help="Optional one session id")
+
+    evolve_trace_summary = evolve_subparsers.add_parser("trace-summary", help="Show structured reasoning trace summary")
+    evolve_trace_summary.add_argument("--session-id", type=int, default=None, help="Optional one session id")
+    evolve_trace_summary.add_argument("--limit", type=int, default=20, help="Top items limit")
 
     return parser.parse_args()
 
@@ -1026,13 +1639,17 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, 
 
     # A-share stock tools - selection/analysis/action planning skeleton
     if config.tools.enable_stock_tools:
-        stock_tools = create_a_share_tools()
+        stock_tools = create_a_share_tools(tushare_token=config.tools.tushare_token)
         tools.extend(stock_tools)
         print(f"{Colors.GREEN}✅ Loaded {len(stock_tools)} A-share stock tools (skeleton){Colors.RESET}")
 
     # NOTE:
     # We intentionally keep a single simulation trading pipeline
     # (sim_trades/sim_positions via SimulateTradeTool) to avoid dual trade ledgers.
+    memory_db = str(get_memory_db_path(workspace_dir))
+    kline_db_path = str(resolve_kline_db_path(workspace_dir))
+    tools.append(SimulateTradeTool(db_path=memory_db, kline_db_path=kline_db_path))
+    print(f"{Colors.GREEN}✅ Loaded simulation trade tool (simulate_trade, session_id: {session_id}){Colors.RESET}")
 
 
 async def _quiet_cleanup():
@@ -1051,7 +1668,7 @@ async def _quiet_cleanup():
         pass
 
 
-async def run_agent(workspace_dir: Path, task: str = None):
+async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: int | None = None):
     """Run Agent in interactive or non-interactive mode.
 
     Args:
@@ -1172,17 +1789,107 @@ async def run_agent(workspace_dir: Path, task: str = None):
         # Remove placeholder if skills not enabled
         system_prompt = system_prompt.replace("{SKILLS_METADATA}", "")
 
-    # 6. Create and start a runtime session (interactive CLI itself is one session).
-    session_manager = SessionManager(db_path=str(get_memory_db_path(workspace_dir)))
-    session_name = f"cli-{session_start.strftime('%Y%m%d-%H%M%S')}"
-    session_id = session_manager.create_session(
-        name=session_name,
-        system_prompt=system_prompt,
-        mode="simulation",
-        initial_capital=100000.0,
+    # 5.5 Inject enabled execution use cases (low-coupling evolution module)
+    evo_service = EvolutionUseCaseService(db_path=str(get_memory_db_path(workspace_dir)))
+    use_case_block = evo_service.render_prompt_block(limit=12)
+    if use_case_block:
+        system_prompt = f"{system_prompt.strip()}\n\n【Execution Use Cases】\n{use_case_block}"
+        print(f"{Colors.GREEN}✅ Injected execution use cases into system prompt{Colors.RESET}")
+
+    create_profile: dict[str, Any] | None = None
+    if attach_session_id is None and task is None and sys.stdin.isatty():
+        try:
+            create_profile = _collect_session_create_inputs(
+                argparse.Namespace(
+                    name=None,
+                    prompt=None,
+                    template=None,
+                    mode=None,
+                    initial_capital=None,
+                    risk_preference=None,
+                    max_single_loss_pct=None,
+                    single_position_cap_pct=None,
+                    stop_loss_pct=None,
+                    take_profit_pct=None,
+                    investment_horizon=None,
+                    event_filter=[],
+                ),
+                workspace_dir,
+            )
+        except ValueError as exc:
+            print(f"{Colors.RED}❌ Interactive session setup failed: {exc}{Colors.RESET}")
+            return
+
+    # 6. Create/start runtime session (or attach existing one) with process binding.
+    try:
+        runtime_ctx = build_runtime_session_context(
+            memory_db_path=get_memory_db_path(workspace_dir),
+            system_prompt=(create_profile or {}).get("system_prompt", system_prompt),
+            attach_session_id=attach_session_id,
+            runtime_type="cli",
+            session_name_prefix="cli",
+            session_name=(create_profile or {}).get("name"),
+            mode=(create_profile or {}).get("mode", "simulation"),
+            initial_capital=float((create_profile or {}).get("initial_capital", 100000.0)),
+            create_session_kwargs=(
+                {
+                    "risk_preference": (create_profile or {}).get("risk_preference"),
+                    "max_single_loss_pct": (create_profile or {}).get("max_single_loss_pct"),
+                    "single_position_cap_pct": (create_profile or {}).get("single_position_cap_pct"),
+                    "stop_loss_pct": (create_profile or {}).get("stop_loss_pct"),
+                    "take_profit_pct": (create_profile or {}).get("take_profit_pct"),
+                    "investment_horizon": (create_profile or {}).get("investment_horizon"),
+                    "event_filter": (create_profile or {}).get("event_filter", []),
+                }
+                if create_profile is not None
+                else None
+            ),
+        )
+    except KeyError:
+        print(f"{Colors.RED}❌ Session not found: {attach_session_id}{Colors.RESET}")
+        return
+    except ValueError as exc:
+        print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
+        return
+
+    session_manager = runtime_ctx.session_manager
+    session_id = runtime_ctx.session_id
+    session_name = runtime_ctx.session_name
+    system_prompt = runtime_ctx.effective_system_prompt
+    session_state = session_manager.get_session(session_id)
+    position_rows = _read_sim_positions(get_memory_db_path(workspace_dir), str(session_id))
+    position_payload = [
+        {
+            "ticker": str(row["ticker"]),
+            "quantity": int(row["quantity"]),
+            "avg_cost": float(row["avg_cost"]) if row["avg_cost"] is not None else None,
+        }
+        for row in position_rows
+    ]
+    system_prompt, prompt_missing = ensure_trade_policy_prompt(
+        prompt=system_prompt,
+        role="A股自动交易代理",
+        session=session_state,
+        positions=position_payload,
     )
-    session_manager.start_session(session_id)
-    print(f"{Colors.GREEN}✅ Runtime session started: {session_id} ({session_name}){Colors.RESET}")
+    if prompt_missing:
+        print(
+            f"{Colors.YELLOW}⚠️ Trading system prompt missing sections: {', '.join(prompt_missing)}; auto-injected guardrail block.{Colors.RESET}"
+        )
+    if runtime_ctx.attached:
+        print(f"{Colors.GREEN}✅ Attached to existing session: {session_id} ({session_name}){Colors.RESET}")
+    else:
+        print(f"{Colors.GREEN}✅ Runtime session started: {session_id} ({session_name}){Colors.RESET}")
+
+    auto_trade_rule = (
+        "【交易执行规则】\n"
+        "- 当前为 simulation（模拟交易）环境。\n"
+        "- 当用户给出明确交易指令（如“买入/卖出 + 标的 + 数量”）时，必须直接调用工具 `simulate_trade` 执行。\n"
+        "- 不要反问“是否确认执行”，不要只给建议不执行。\n"
+        "- 若参数缺失（标的/数量/日期）再提问补全；若参数完整则立即执行并回报成交结果。"
+    )
+    if auto_trade_rule not in system_prompt:
+        system_prompt = f"{system_prompt.strip()}\n\n{auto_trade_rule}"
 
     # 7. Add workspace-dependent tools
     add_workspace_tools(tools, config, workspace_dir, session_id=session_id)
@@ -1206,16 +1913,59 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # 9.5 Non-interactive mode: execute task and exit
     # 学习提示：--task 会直接跑一次 agent.run() 然后退出，不进入 REPL 循环。
     if task:
+        direct_order = _parse_direct_trade_order(task)
+        if direct_order:
+            trade_tool = next((t for t in tools if getattr(t, "name", "") == "simulate_trade"), None)
+            if trade_tool is None:
+                print(f"\n{Colors.RED}❌ simulate_trade tool not available{Colors.RESET}")
+            else:
+                trade_date = str(direct_order.get("trade_date") or _resolve_trade_date_for_execution(get_memory_db_path(workspace_dir)))
+                result = await trade_tool.execute(
+                    session_id=session_id,
+                    action=direct_order["action"],
+                    ticker=direct_order["ticker"],
+                    quantity=direct_order["quantity"],
+                    trade_date=trade_date,
+                    reason="direct_user_instruction",
+                )
+                content = result.content if result.success else f"simulate trade failed: {result.error}"
+                await _persist_turn_memory(tools, session_id=session_id, category="conversation_user", content=task)
+                await _persist_turn_memory(tools, session_id=session_id, category="conversation_assistant", content=content)
+                session_manager.record_critical_memory(
+                    session_id=session_id,
+                    event_type="manual_trade",
+                    operation=direct_order["action"],
+                    reason="direct_user_instruction",
+                    content=json.dumps(
+                        {
+                            "ticker": direct_order["ticker"],
+                            "quantity": direct_order["quantity"],
+                            "trade_date": trade_date,
+                            "result": content,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                if result.success:
+                    print(f"\n{Colors.GREEN}{content}{Colors.RESET}\n")
+                else:
+                    print(f"\n{Colors.RED}{content}{Colors.RESET}\n")
+            print_stats(agent, session_start)
+            runtime_ctx.close(stop_session=True)
+            await _quiet_cleanup()
+            return
+
         print(f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Executing task...{Colors.RESET}\n")
         await _persist_turn_memory(tools, session_id=session_id, category="conversation_user", content=task)
         mem_snapshot = build_session_memory_snapshot(
-            load_recent_session_memories(get_memory_db_path(workspace_dir), session_id=session_id, limit=12)
+            _load_prompt_memories(get_memory_db_path(workspace_dir), session_id=session_id, recent_limit=12, critical_limit=8)
         )
         if mem_snapshot:
             agent.add_user_message(f"[Session Memory]\n{mem_snapshot}\n\n[User Request]\n{task}")
         else:
             agent.add_user_message(task)
         try:
+            before_msg_count = len(agent.messages)
             final_reply = await agent.run()
             await _persist_turn_memory(
                 tools,
@@ -1223,12 +1973,18 @@ async def run_agent(workspace_dir: Path, task: str = None):
                 category="conversation_assistant",
                 content=final_reply or "",
             )
+            _record_sim_trade_critical_from_messages(
+                session_manager=session_manager,
+                session_id=session_id,
+                messages=agent.messages[before_msg_count:],
+                event_type="chat_turn",
+            )
         except Exception as e:
             print(f"\n{Colors.RED}❌ Error: {e}{Colors.RESET}")
         finally:
             print_stats(agent, session_start)
 
-        session_manager.stop_session(session_id)
+        runtime_ctx.close(stop_session=True)
         # Cleanup MCP connections
         await _quiet_cleanup()
         return
@@ -1279,197 +2035,355 @@ async def run_agent(workspace_dir: Path, task: str = None):
         key_bindings=kb,
     )
 
-    # 10. Interactive loop
-    # 学习提示：这里是一个 REPL：
-    # - 先处理 /help /clear 等命令
-    # - 再把普通输入交给 Agent.run()
-    # - 每轮输入都共享同一个 agent.messages（多轮记忆）
-    while True:
-        try:
-            # Get user input using prompt_toolkit
-            user_input = await session.prompt_async(
-                [
-                    ("class:prompt", "You"),
-                    ("", " › "),
-                ],
-                multiline=False,
-                enable_history_search=True,
+    agent_run_lock = asyncio.Lock()
+    event_poller_stop = asyncio.Event()
+
+    async def _process_inbox_event(item: dict) -> None:
+        event = item.get("event_payload")
+        if not isinstance(event, dict):
+            session_manager.complete_inbox_event(int(item["id"]), success=False, error="invalid event payload")
+            return
+
+        begin_token = session_manager.begin_event_processing(session_id, event)
+        if not begin_token.get("process"):
+            reason = f"idempotent_skip status={begin_token.get('status')}"
+            session_manager.mark_event_skipped(session_id, event, reason)
+            session_manager.complete_inbox_event(int(item["id"]), success=True)
+            print(f"\n{Colors.YELLOW}⚠️ Event skipped: {reason}{Colors.RESET}\n")
+            return
+
+        event_prompt = (
+            "[System Event]\n"
+            f"type: {event.get('type')}\n"
+            f"event_id: {event.get('event_id')}\n"
+            f"payload: {json.dumps(event, ensure_ascii=False)}\n\n"
+            "This event is delivered by background dispatcher. "
+            "Please analyze and decide whether simulated trade actions are needed."
+        )
+        event_type = str(event.get("type") or "")
+        trading_date = str(event.get("date") or datetime.now().date().isoformat())
+
+        async with agent_run_lock:
+            print(
+                f"\n{Colors.BRIGHT_BLUE}Event{Colors.RESET} {Colors.DIM}›{Colors.RESET} "
+                f"{Colors.DIM}Processing {event.get('type')} ({event.get('event_id')})...{Colors.RESET}\n"
             )
-            user_input = user_input.strip()
-
-            if not user_input:
-                continue
-
-            # Handle commands
-            if user_input.startswith("/"):
-                command = user_input.lower()
-
-                if command in ["/exit", "/quit", "/q"]:
-                    print(f"\n{Colors.BRIGHT_YELLOW}👋 Goodbye! Thanks for using Mini Agent{Colors.RESET}\n")
-                    print_stats(agent, session_start)
-                    break
-
-                elif command == "/help":
-                    print_help()
-                    continue
-
-                elif command == "/clear":
-                    # Clear message history but keep system prompt
-                    old_count = len(agent.messages)
-                    agent.messages = [agent.messages[0]]  # Keep only system message
-                    print(f"{Colors.GREEN}✅ Cleared {old_count - 1} messages, starting new session{Colors.RESET}\n")
-                    continue
-
-                elif command == "/history":
-                    print(f"\n{Colors.BRIGHT_CYAN}Current session message count: {len(agent.messages)}{Colors.RESET}\n")
-                    continue
-
-                elif command == "/stats":
-                    print_stats(agent, session_start)
-                    continue
-
-                elif command == "/log" or command.startswith("/log "):
-                    # Parse /log command
-                    parts = user_input.split(maxsplit=1)
-                    if len(parts) == 1:
-                        # /log - show log directory
-                        show_log_directory(open_file_manager=True)
-                    else:
-                        # /log <filename> - read specific log file
-                        filename = parts[1].strip("\"'")
-                        read_log_file(filename)
-                    continue
-
+            try:
+                if event_type == "daily_review":
+                    runtime = build_decision_runtime(workspace_dir, get_memory_db_path(workspace_dir))
+                    decision = await run_llm_decision(
+                        runtime=runtime,
+                        session_id=session_id,
+                        trading_date=trading_date,
+                        event_id=str(event.get("event_id") or "") or None,
+                    )
+                    final_reply = str(decision.get("agent_analysis") or "")
+                    trade_actions = list(decision.get("trade_actions") or [])
+                    signal = decision.get("trade_signal")
+                    execution = decision.get("execution")
+                    execution_error = decision.get("execution_error")
+                    primary_action = trade_actions[0] if trade_actions else (signal if isinstance(signal, dict) else None)
+                    signal_action = str(primary_action.get("action")) if isinstance(primary_action, dict) else None
+                    signal_ticker = str(primary_action.get("ticker")) if isinstance(primary_action, dict) else None
+                    signal_qty = primary_action.get("quantity") if isinstance(primary_action, dict) else None
+                    summary = (
+                        f"[daily_review] actions={trade_actions or signal} execution={execution or execution_error or 'no_trade'} "
+                        f"date={trading_date}"
+                    )
+                    await _persist_turn_memory(
+                        tools,
+                        session_id=session_id,
+                        category="conversation_user",
+                        content=f"[event]{event_prompt}",
+                    )
+                    await _persist_turn_memory(
+                        tools,
+                        session_id=session_id,
+                        category="conversation_assistant",
+                        content=f"{final_reply}\n\n{summary}".strip(),
+                    )
+                    op: str | None = None
+                    if execution_error:
+                        op = f"{signal_action}_failed" if signal_action else "trade_failed"
+                    elif execution:
+                        if signal_action:
+                            op = signal_action
+                        else:
+                            parsed_exec = _parse_sim_trade_tool_content(str(execution))
+                            parsed_action = str(parsed_exec.get("action") or "").strip()
+                            op = parsed_action or "trade_executed"
+                    elif signal_action:
+                        op = f"{signal_action}_planned"
+                    reason = final_reply.strip().replace("\n", " ")[:500]
+                    critical_content = json.dumps(
+                        {
+                            "date": trading_date,
+                            "signal": signal,
+                            "trade_actions": trade_actions,
+                            "execution": execution,
+                            "execution_error": execution_error,
+                            "ticker": signal_ticker,
+                            "quantity": signal_qty,
+                        },
+                        ensure_ascii=False,
+                    )
+                    if op:
+                        session_manager.record_critical_memory(
+                            session_id=session_id,
+                            event_id=str(event.get("event_id") or ""),
+                            event_type=event_type,
+                            operation=op,
+                            reason=reason or None,
+                            content=critical_content,
+                        )
+                    success = execution_error is None
+                    err = execution_error
+                    result_text = summary
                 else:
+                    await _persist_turn_memory(
+                        tools,
+                        session_id=session_id,
+                        category="conversation_user",
+                        content=f"[event]{event_prompt}",
+                    )
+                    mem_snapshot = build_session_memory_snapshot(
+                        _load_prompt_memories(
+                            get_memory_db_path(workspace_dir),
+                            session_id=session_id,
+                            recent_limit=12,
+                            critical_limit=8,
+                        )
+                    )
+                    if mem_snapshot:
+                        agent.add_user_message(f"[Session Memory]\n{mem_snapshot}\n\n[Event]\n{event_prompt}")
+                    else:
+                        agent.add_user_message(event_prompt)
+                    before_msg_count = len(agent.messages)
+                    final_reply = await agent.run()
+                    await _persist_turn_memory(
+                        tools,
+                        session_id=session_id,
+                        category="conversation_assistant",
+                        content=final_reply or "",
+                    )
+                    _record_sim_trade_critical_from_messages(
+                        session_manager=session_manager,
+                        session_id=session_id,
+                        messages=agent.messages[before_msg_count:],
+                        event_type=event_type or "event",
+                        event_id=str(event.get("event_id") or "") or None,
+                    )
+                    success = True
+                    err = None
+                    result_text = (final_reply or "")[:2000]
+
+                await _persist_turn_memory(
+                    tools,
+                    session_id=session_id,
+                    category="event_result",
+                    content=f"type={event_type} date={trading_date} success={success}",
+                )
+                session_manager.finalize_event_processing(
+                    session_id,
+                    event,
+                    status="succeeded" if success else "failed",
+                    success=success,
+                    result=result_text,
+                    error=err,
+                    started_at=begin_token.get("started_at"),
+                )
+                session_manager.complete_inbox_event(int(item["id"]), success=success, error=err)
+            except Exception as exc:
+                error = str(exc)
+                session_manager.finalize_event_processing(
+                    session_id,
+                    event,
+                    status="failed",
+                    success=False,
+                    error=error,
+                    started_at=begin_token.get("started_at"),
+                )
+                session_manager.complete_inbox_event(int(item["id"]), success=False, error=error)
+                print(f"\n{Colors.RED}❌ Event processing failed: {error}{Colors.RESET}\n")
+
+    async def _event_poller_loop() -> None:
+        while not event_poller_stop.is_set():
+            try:
+                runtime_ctx.heartbeat()
+                item = session_manager.claim_next_pending_event(session_id)
+                if item is None:
+                    await asyncio.sleep(1.0)
+                    continue
+                await _process_inbox_event(item)
+            except Exception as exc:
+                print(f"\n{Colors.YELLOW}⚠️ Event poller warning: {exc}{Colors.RESET}\n")
+                await asyncio.sleep(1.0)
+
+    event_poller_task = asyncio.create_task(_event_poller_loop())
+
+    # 10. Interactive loop
+    try:
+        while True:
+            try:
+                user_input = await session.prompt_async(
+                    [
+                        ("class:prompt", "You"),
+                        ("", " › "),
+                    ],
+                    multiline=False,
+                    enable_history_search=True,
+                )
+                user_input = user_input.strip()
+                if not user_input:
+                    continue
+
+                if user_input.startswith("/"):
+                    command = user_input.lower()
+                    if command in ["/exit", "/quit", "/q"]:
+                        print(f"\n{Colors.BRIGHT_YELLOW}👋 Goodbye! Thanks for using Mini Agent{Colors.RESET}\n")
+                        print_stats(agent, session_start)
+                        break
+                    if command == "/help":
+                        print_help()
+                        continue
+                    if command == "/clear":
+                        old_count = len(agent.messages)
+                        agent.messages = [agent.messages[0]]
+                        print(f"{Colors.GREEN}✅ Cleared {old_count - 1} messages, starting new session{Colors.RESET}\n")
+                        continue
+                    if command == "/history":
+                        print(f"\n{Colors.BRIGHT_CYAN}Current session message count: {len(agent.messages)}{Colors.RESET}\n")
+                        continue
+                    if command == "/stats":
+                        print_stats(agent, session_start)
+                        continue
+                    if command == "/log" or command.startswith("/log "):
+                        parts = user_input.split(maxsplit=1)
+                        if len(parts) == 1:
+                            show_log_directory(open_file_manager=True)
+                        else:
+                            filename = parts[1].strip("\"'")
+                            read_log_file(filename)
+                        continue
                     print(f"{Colors.RED}❌ Unknown command: {user_input}{Colors.RESET}")
                     print(f"{Colors.DIM}Type /help to see available commands{Colors.RESET}\n")
                     continue
 
-            # Normal conversation - exit check
-            if user_input.lower() in ["exit", "quit", "q"]:
-                print(f"\n{Colors.BRIGHT_YELLOW}👋 Goodbye! Thanks for using Mini Agent{Colors.RESET}\n")
+                if user_input.lower() in ["exit", "quit", "q"]:
+                    print(f"\n{Colors.BRIGHT_YELLOW}👋 Goodbye! Thanks for using Mini Agent{Colors.RESET}\n")
+                    print_stats(agent, session_start)
+                    break
+
+                direct_order = _parse_direct_trade_order(user_input)
+                if direct_order:
+                    async with agent_run_lock:
+                        trade_tool = next((t for t in tools if getattr(t, "name", "") == "simulate_trade"), None)
+                        if trade_tool is None:
+                            print(f"\n{Colors.RED}❌ simulate_trade tool not available{Colors.RESET}\n")
+                            continue
+                        trade_date = str(
+                            direct_order.get("trade_date")
+                            or _resolve_trade_date_for_execution(get_memory_db_path(workspace_dir))
+                        )
+                        result = await trade_tool.execute(
+                            session_id=session_id,
+                            action=direct_order["action"],
+                            ticker=direct_order["ticker"],
+                            quantity=direct_order["quantity"],
+                            trade_date=trade_date,
+                            reason="direct_user_instruction",
+                        )
+                        content = result.content if result.success else f"simulate trade failed: {result.error}"
+                        await _persist_turn_memory(
+                            tools,
+                            session_id=session_id,
+                            category="conversation_user",
+                            content=user_input,
+                        )
+                        await _persist_turn_memory(
+                            tools,
+                            session_id=session_id,
+                            category="conversation_assistant",
+                            content=content,
+                        )
+                        session_manager.record_critical_memory(
+                            session_id=session_id,
+                            event_type="manual_trade",
+                            operation=direct_order["action"],
+                            reason="direct_user_instruction",
+                            content=json.dumps(
+                                {
+                                    "ticker": direct_order["ticker"],
+                                    "quantity": direct_order["quantity"],
+                                    "trade_date": trade_date,
+                                    "result": content,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                    if result.success:
+                        print(f"\n{Colors.GREEN}{content}{Colors.RESET}\n")
+                    else:
+                        print(f"\n{Colors.RED}{content}{Colors.RESET}\n")
+                    print(f"\n{Colors.DIM}{'─' * 60}{Colors.RESET}\n")
+                    continue
+
+                async with agent_run_lock:
+                    print(
+                        f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Thinking...{Colors.RESET}\n"
+                    )
+                    await _persist_turn_memory(
+                        tools,
+                        session_id=session_id,
+                        category="conversation_user",
+                        content=user_input,
+                    )
+                    mem_snapshot = build_session_memory_snapshot(
+                        _load_prompt_memories(
+                            get_memory_db_path(workspace_dir),
+                            session_id=session_id,
+                            recent_limit=12,
+                            critical_limit=8,
+                        )
+                    )
+                    if mem_snapshot:
+                        agent.add_user_message(f"[Session Memory]\n{mem_snapshot}\n\n[User Request]\n{user_input}")
+                    else:
+                        agent.add_user_message(user_input)
+
+                    before_msg_count = len(agent.messages)
+                    final_reply = await agent.run()
+                    await _persist_turn_memory(
+                        tools,
+                        session_id=session_id,
+                        category="conversation_assistant",
+                        content=final_reply or "",
+                    )
+                    _record_sim_trade_critical_from_messages(
+                        session_manager=session_manager,
+                        session_id=session_id,
+                        messages=agent.messages[before_msg_count:],
+                        event_type="chat_turn",
+                    )
+                print(f"\n{Colors.DIM}{'─' * 60}{Colors.RESET}\n")
+
+            except KeyboardInterrupt:
+                print(f"\n\n{Colors.BRIGHT_YELLOW}👋 Interrupt signal detected, exiting...{Colors.RESET}\n")
                 print_stats(agent, session_start)
                 break
-
-            # Run Agent with Esc cancellation support
-            # 学习提示：Esc 的取消不是强杀线程，而是设置 cancel_event。
-            # Agent 在安全检查点读取该事件，保证消息状态一致。
-            print(
-                f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Thinking... (Esc to cancel){Colors.RESET}\n"
-            )
-            await _persist_turn_memory(
-                tools,
-                session_id=session_id,
-                category="conversation_user",
-                content=user_input,
-            )
-            mem_snapshot = build_session_memory_snapshot(
-                load_recent_session_memories(get_memory_db_path(workspace_dir), session_id=session_id, limit=12)
-            )
-            if mem_snapshot:
-                agent.add_user_message(f"[Session Memory]\n{mem_snapshot}\n\n[User Request]\n{user_input}")
-            else:
-                agent.add_user_message(user_input)
-
-            # Create cancellation event
-            cancel_event = asyncio.Event()
-            agent.cancel_event = cancel_event
-
-            # Esc key listener thread
-            esc_listener_stop = threading.Event()
-            esc_cancelled = [False]  # Mutable container for thread access
-
-            def esc_key_listener():
-                """Listen for Esc key in a separate thread."""
-                # 学习提示：按键监听放在线程里，避免阻塞 asyncio 主事件循环。
-                if platform.system() == "Windows":
-                    try:
-                        import msvcrt
-
-                        while not esc_listener_stop.is_set():
-                            if msvcrt.kbhit():
-                                char = msvcrt.getch()
-                                if char == b"\x1b":  # Esc
-                                    print(f"\n{Colors.BRIGHT_YELLOW}⏹️  Esc pressed, cancelling...{Colors.RESET}")
-                                    esc_cancelled[0] = True
-                                    cancel_event.set()
-                                    break
-                            esc_listener_stop.wait(0.05)
-                    except Exception:
-                        pass
-                    return
-
-                # Unix/macOS
-                try:
-                    import select
-                    import termios
-                    import tty
-
-                    fd = sys.stdin.fileno()
-                    old_settings = termios.tcgetattr(fd)
-
-                    try:
-                        tty.setcbreak(fd)
-                        while not esc_listener_stop.is_set():
-                            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
-                            if rlist:
-                                char = sys.stdin.read(1)
-                                if char == "\x1b":  # Esc
-                                    print(f"\n{Colors.BRIGHT_YELLOW}⏹️  Esc pressed, cancelling...{Colors.RESET}")
-                                    esc_cancelled[0] = True
-                                    cancel_event.set()
-                                    break
-                    finally:
-                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                except Exception:
-                    pass
-
-            # Start Esc listener thread
-            esc_thread = threading.Thread(target=esc_key_listener, daemon=True)
-            esc_thread.start()
-
-            # Run agent with periodic cancellation check
-            # 学习提示：外层轮询负责把线程侧的“按下 Esc”同步到 asyncio.Event。
-            try:
-                agent_task = asyncio.create_task(agent.run())
-
-                # Poll for cancellation while agent runs
-                while not agent_task.done():
-                    if esc_cancelled[0]:
-                        cancel_event.set()
-                    await asyncio.sleep(0.1)
-
-                # Get result
-                final_reply = agent_task.result()
-                await _persist_turn_memory(
-                    tools,
-                    session_id=session_id,
-                    category="conversation_assistant",
-                    content=final_reply or "",
-                )
-
-            except asyncio.CancelledError:
-                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  Agent execution cancelled{Colors.RESET}")
-            finally:
-                agent.cancel_event = None
-                esc_listener_stop.set()
-                esc_thread.join(timeout=0.2)
-
-            # Visual separation
-            print(f"\n{Colors.DIM}{'─' * 60}{Colors.RESET}\n")
-
-        except KeyboardInterrupt:
-            print(f"\n\n{Colors.BRIGHT_YELLOW}👋 Interrupt signal detected, exiting...{Colors.RESET}\n")
-            print_stats(agent, session_start)
-            break
-
-        except Exception as e:
-            print(f"\n{Colors.RED}❌ Error: {e}{Colors.RESET}")
-            print(f"{Colors.DIM}{'─' * 60}{Colors.RESET}\n")
-
-    session_manager.stop_session(session_id)
-    # 11. Cleanup MCP connections
-    await _quiet_cleanup()
+            except Exception as e:
+                print(f"\n{Colors.RED}❌ Error: {e}{Colors.RESET}")
+                print(f"{Colors.DIM}{'─' * 60}{Colors.RESET}\n")
+    finally:
+        event_poller_stop.set()
+        event_poller_task.cancel()
+        try:
+            await event_poller_task
+        except asyncio.CancelledError:
+            pass
+        runtime_ctx.close(stop_session=True)
+        # 11. Cleanup MCP connections
+        await _quiet_cleanup()
 
 
 def handle_health_command(args: argparse.Namespace, workspace_dir: Path) -> None:
@@ -1494,6 +2408,13 @@ def handle_sync_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Sync A-share daily K-line data into unified DB."""
     db_path = get_default_memory_db_path()
     kline_db = KLineDB(db_path=str(db_path))
+    tushare_token = ""
+    try:
+        cfg = Config.from_yaml(Config.get_default_config_path())
+        tushare_token = (cfg.tools.tushare_token or "").strip()
+    except Exception:
+        tushare_token = ""
+    config_path = Config.get_default_config_path()
 
     if args.cron:
         print("Recommended crontab entries:")
@@ -1508,8 +2429,27 @@ def handle_sync_command(args: argparse.Namespace, workspace_dir: Path) -> None:
             print(f"{Colors.RED}❌ Failed to install cron: {detail}{Colors.RESET}")
         return
 
+    if args.all and not tushare_token:
+        print(f"{Colors.RED}❌ tools.tushare_token is empty in config: {config_path}{Colors.RESET}")
+        print(f"{Colors.YELLOW}Please set tools.tushare_token before running `sync --all`.{Colors.RESET}")
+        return
+
+    start_date = args.start
+    end_date = args.end
+    if args.all and args.start == "1991-01-01" and args.end is None:
+        # Default full-range is too heavy for day-to-day usage; switch to daily incremental.
+        today = datetime.now().date().isoformat()
+        start_date = today
+        end_date = today
+        print(f"{Colors.YELLOW}ℹ️ --all default changed to daily incremental: {today}{Colors.RESET}")
+
     try:
-        tickers = resolve_ticker_universe(args.tickers or "", args.all)
+        tickers = resolve_ticker_universe(
+            args.tickers or "",
+            args.all,
+            kline_db=kline_db,
+            tushare_token=tushare_token,
+        )
     except Exception as exc:
         print(f"{Colors.RED}❌ Failed to fetch ticker universe: {exc}{Colors.RESET}")
         return
@@ -1518,8 +2458,14 @@ def handle_sync_command(args: argparse.Namespace, workspace_dir: Path) -> None:
         return
 
     print(f"{Colors.CYAN}🔄 Syncing K-line data -> {db_path}{Colors.RESET}")
-    result = sync_kline_data(kline_db, tickers=tickers, start=args.start, end=args.end)
-    print(f"tickers={len(tickers)}, range={args.start}~{result.end_date}")
+    result = sync_kline_data(
+        kline_db,
+        tickers=tickers,
+        start=start_date,
+        end=end_date,
+        tushare_token=tushare_token,
+    )
+    print(f"tickers={len(tickers)}, range={start_date}~{result.end_date}")
 
     print(f"{Colors.GREEN}✅ Sync done{Colors.RESET}")
     print(f"success={result.success_count}, failed={len(result.failed)}, rows={result.total_rows}")
@@ -1593,8 +2539,15 @@ def main():
         handle_sync_command(args, workspace_dir)
         return
 
+    if args.command == "evolve":
+        if not args.evolve_command:
+            print(f"{Colors.RED}❌ Missing evolve action. Use: scan/list/enable/disable/prompt/trace-sync/trace-summary{Colors.RESET}")
+            return
+        handle_evolve_command(args, workspace_dir)
+        return
+
     # Run the agent (config always loaded from package directory)
-    asyncio.run(run_agent(workspace_dir, task=args.task))
+    asyncio.run(run_agent(workspace_dir, task=args.task, attach_session_id=args.session_id))
 
 
 if __name__ == "__main__":

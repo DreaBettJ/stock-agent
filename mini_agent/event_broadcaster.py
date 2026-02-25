@@ -41,6 +41,19 @@ class EventBroadcaster:
 
     async def trigger_session(self, session: ExperimentSession, event: dict[str, Any]) -> dict[str, Any]:
         """Trigger one session and record result."""
+        begin_token = self.session_manager.begin_event_processing(session.session_id, event)
+        if not begin_token.get("process"):
+            reason = f"idempotent_skip status={begin_token.get('status')}"
+            record = {
+                "session_id": session.session_id,
+                "event_type": event.get("type"),
+                "success": False,
+                "error": reason,
+            }
+            self.session_manager.mark_event_skipped(session.session_id, event, reason)
+            self.event_results.append(record)
+            return record
+
         try:
             # 调用外部注入的 trigger 回调，保持广播器本身与具体业务解耦。
             output = await self.trigger(session, event)
@@ -59,13 +72,14 @@ class EventBroadcaster:
                 "error": str(exc),
             }
 
-        # 写入数据库事件日志，便于后续观测与审计。
-        self.session_manager.record_event_result(
+        self.session_manager.finalize_event_processing(
             session_id=session.session_id,
             event=event,
+            status="succeeded" if record.get("success") else "failed",
             success=bool(record.get("success")),
             result=record.get("result"),
             error=record.get("error"),
+            started_at=begin_token.get("started_at"),
         )
 
         # 保存历史结果，便于上层调试/观测。

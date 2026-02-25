@@ -11,7 +11,8 @@ import pytest
 
 from mini_agent import LLMClient
 from mini_agent.agent import Agent
-from mini_agent.schema import LLMResponse, Message, TokenUsage
+from mini_agent.schema import FunctionCall, LLMResponse, Message, TokenUsage, ToolCall
+from mini_agent.tools.base import Tool, ToolResult
 from mini_agent.tools.bash_tool import BashTool
 from mini_agent.tools.file_tools import ReadTool, WriteTool
 from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
@@ -209,3 +210,69 @@ async def test_intercept_log_generation(monkeypatch, temp_workspace):
     event_names = {item["event"] for item in events}
     assert "before_send" in event_names
     assert "after_response" in event_names
+
+
+@pytest.mark.asyncio
+async def test_simulate_trade_session_id_bound_to_runtime(temp_workspace):
+    class DummySimTradeTool(Tool):
+        def __init__(self):
+            self.calls = []
+
+        @property
+        def name(self) -> str:
+            return "simulate_trade"
+
+        @property
+        def description(self) -> str:
+            return "dummy"
+
+        @property
+        def parameters(self):
+            return {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            return ToolResult(success=True, content="ok")
+
+    tool = DummySimTradeTool()
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.generate = AsyncMock(
+        side_effect=[
+            LLMResponse(
+                content="",
+                finish_reason="tool_use",
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        type="function",
+                        function=FunctionCall(
+                            name="simulate_trade",
+                            arguments={
+                                "session_id": "simulation",
+                                "action": "buy",
+                                "ticker": "600519",
+                                "quantity": 100,
+                                "trade_date": "2026-02-22",
+                            },
+                        ),
+                    )
+                ],
+            ),
+            LLMResponse(content="done", finish_reason="stop"),
+        ]
+    )
+
+    agent = Agent(
+        llm_client=mock_llm,
+        system_prompt="System",
+        tools=[tool],
+        workspace_dir=temp_workspace,
+        enable_intercept_log=False,
+        session_id=9,
+    )
+    agent.add_user_message("buy")
+    result = await agent.run()
+
+    assert result == "done"
+    assert len(tool.calls) == 1
+    assert tool.calls[0]["session_id"] == 9

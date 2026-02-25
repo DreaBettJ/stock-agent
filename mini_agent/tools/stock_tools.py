@@ -25,11 +25,15 @@ import os
 import random
 import time
 import re
+import sqlite3
 from abc import ABC
 from datetime import datetime, timedelta
 from typing import Any
 
+from mini_agent.paths import DEFAULT_MEMORY_DB_PATH
+
 from .base import Tool, ToolResult
+from .kline_db_tool import KLineDB
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +89,634 @@ class AShareDataBackend(ABC):
     async def screen_stocks(self, strategy: str, timestamp: str | None = None, max_results: int = 20) -> list[dict[str, Any]]:
         raise NotImplementedError("TODO: implement stock screening logic")
 
+    async def get_technical_signals(
+        self,
+        ticker: str,
+        timestamp: str | None = None,
+        window: int = 120,
+    ) -> dict[str, Any]:
+        raise NotImplementedError("TODO: implement technical signals logic")
+
 
 class PlaceholderAShareDataBackend(AShareDataBackend):
     """Default backend used before real data providers are wired in.
 
     默认占位后端：便于先把 Agent 工具链跑通，再逐步接入实际数据服务。
     """
+
+
+class LocalAShareDataBackend(AShareDataBackend):
+    """Local SQLite-backed backend using daily_kline snapshot."""
+
+    def __init__(self, db_path: str = str(DEFAULT_MEMORY_DB_PATH)):
+        self.kline_db = KLineDB(db_path=db_path)
+        self.db_path = self.kline_db.db_path
+
+    async def get_quote(self, ticker: str, timestamp: str | None = None) -> dict[str, Any]:
+        normalized_ts = normalize_timestamp(timestamp)
+        asof = datetime.fromisoformat(normalized_ts).replace(tzinfo=None).strftime("%Y-%m-%d")
+        symbol = self.kline_db.normalize_ticker(ticker)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT ticker, date, open, high, low, close, volume, amount
+                FROM daily_kline
+                WHERE ticker = ? AND date <= ?
+                ORDER BY date DESC
+                LIMIT 1
+                """,
+                (symbol, asof),
+            ).fetchone()
+        if row is None:
+            return {
+                "ticker": ticker,
+                "symbol": symbol,
+                "timestamp": normalized_ts,
+                "source": "local:daily_kline",
+                "quote": None,
+            }
+        return {
+            "ticker": ticker,
+            "symbol": symbol,
+            "timestamp": normalized_ts,
+            "source": "local:daily_kline",
+            "quote": {
+                "date": row["date"],
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "volume": row["volume"],
+                "amount": row["amount"],
+                "turnover_rate": None,
+            },
+        }
+
+    async def get_fundamentals(self, ticker: str, timestamp: str | None = None, period: str = "ttm") -> dict[str, Any]:
+        raise NotImplementedError("Local fundamentals not available in daily_kline DB.")
+
+    async def get_news(self, timestamp: str | None = None, ticker: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        raise NotImplementedError("Local news not available in daily_kline DB.")
+
+    async def screen_stocks(self, strategy: str, timestamp: str | None = None, max_results: int = 20) -> list[dict[str, Any]]:
+        normalized_ts = normalize_timestamp(timestamp)
+        asof = datetime.fromisoformat(normalized_ts).replace(tzinfo=None).strftime("%Y-%m-%d")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            day_row = conn.execute(
+                "SELECT MAX(date) AS d FROM daily_kline WHERE date <= ?",
+                (asof,),
+            ).fetchone()
+            effective_date = str(day_row["d"]) if day_row and day_row["d"] else None
+            if not effective_date:
+                return []
+            universe_limit = max(max_results * 40, 400)
+            rows = conn.execute(
+                """
+                SELECT ticker, date, open, high, low, close, volume, amount,
+                       CASE WHEN open IS NOT NULL AND open != 0 THEN (close - open) / open * 100 ELSE NULL END AS change_pct
+                FROM daily_kline
+                WHERE date = ?
+                ORDER BY amount DESC
+                LIMIT ?
+                """,
+                (effective_date, universe_limit),
+            ).fetchall()
+        if not rows:
+            return []
+
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            open_price = float(row["open"] or 0.0)
+            high = float(row["high"] or 0.0)
+            low = float(row["low"] or 0.0)
+            close = float(row["close"] or 0.0)
+            amount = float(row["amount"] or 0.0)
+            change_pct = float(row["change_pct"] or 0.0)
+            amplitude = ((high - low) / open_price * 100.0) if open_price > 0 else 0.0
+            if close <= 0 or amount < 5e7:
+                continue
+            candidates.append(
+                {
+                    "代码": str(row["ticker"]),
+                    "名称": str(row["ticker"]),
+                    "最新价": close,
+                    "涨跌幅": change_pct,
+                    "换手率": None,
+                    "振幅": amplitude,
+                    "市盈率-动态": None,
+                    "市净率": None,
+                    "总市值": None,
+                    "成交额": amount,
+                }
+            )
+        if not candidates:
+            return []
+
+        filtered: list[dict[str, Any]] = []
+        for item in candidates:
+            change_pct = float(item["涨跌幅"] or 0.0)
+            amplitude = float(item["振幅"] or 0.0)
+            amount = float(item["成交额"] or 0.0)
+            if strategy == "low_vol":
+                if amplitude <= 5.0 and abs(change_pct) <= 3.0:
+                    filtered.append(item)
+            elif strategy == "value":
+                if -3.5 <= change_pct <= 5.0 and amplitude <= 8.0:
+                    filtered.append(item)
+            elif strategy == "dividend":
+                if abs(change_pct) <= 6.0 and amplitude <= 8.0 and amount >= 1e8:
+                    filtered.append(item)
+            else:  # quality
+                if abs(change_pct) <= 9.5 and amplitude <= 12.0:
+                    filtered.append(item)
+        if not filtered:
+            filtered = candidates[:]
+
+        liquidity_vals = [float(x["成交额"] or 0.0) for x in filtered]
+        stability_vals = [abs(float(x["涨跌幅"] or 0.0)) for x in filtered]
+        volatility_vals = [float(x["振幅"] or 0.0) for x in filtered]
+        mean_liquidity = (sum(liquidity_vals) / len(liquidity_vals)) if liquidity_vals else 1.0
+        mean_stability = (sum(stability_vals) / len(stability_vals)) if stability_vals else 1.0
+        mean_volatility = (sum(volatility_vals) / len(volatility_vals)) if volatility_vals else 1.0
+        mean_liquidity = mean_liquidity if mean_liquidity > 1e-6 else 1.0
+        mean_stability = mean_stability if mean_stability > 1e-6 else 1.0
+        mean_volatility = mean_volatility if mean_volatility > 1e-6 else 1.0
+
+        weights_map = {
+            "quality": {"liquidity": 0.30, "stability": 0.30, "low_vol": 0.40},
+            "dividend": {"liquidity": 0.45, "stability": 0.25, "low_vol": 0.30},
+            "low_vol": {"liquidity": 0.20, "stability": 0.35, "low_vol": 0.45},
+            "value": {"liquidity": 0.25, "stability": 0.20, "low_vol": 0.25, "value_pullback": 0.30},
+        }
+        weights = weights_map.get(strategy, weights_map["quality"])
+
+        scored: list[dict[str, Any]] = []
+        for item in filtered:
+            change_pct = float(item["涨跌幅"] or 0.0)
+            amount = float(item["成交额"] or 0.0)
+            amplitude = float(item["振幅"] or 0.0)
+            factor_scores = {
+                "score_liquidity": min(1.0, amount / mean_liquidity),
+                "score_stability": 1.0 / (1.0 + abs(change_pct) / mean_stability),
+                "score_low_vol": 1.0 / (1.0 + amplitude / mean_volatility),
+                "score_value_pullback": 1.0 / (1.0 + max(change_pct, 0.0)),
+            }
+            total_score = 0.0
+            for k, w in weights.items():
+                key = {
+                    "liquidity": "score_liquidity",
+                    "stability": "score_stability",
+                    "low_vol": "score_low_vol",
+                    "value_pullback": "score_value_pullback",
+                }[k]
+                total_score += factor_scores.get(key, 0.0) * float(w)
+
+            scored.append(
+                {
+                    **item,
+                    "strategy": strategy,
+                    "total_score": round(total_score, 4),
+                    "factor_scores": {k: round(float(v), 4) for k, v in factor_scores.items()},
+                    "timestamp": normalized_ts,
+                    "screen_note": (
+                        "local kline snapshot screening with strategy-specific filters and proxy scoring "
+                        "(liquidity/stability/volatility)."
+                    ),
+                }
+            )
+
+        scored.sort(key=lambda x: float(x.get("total_score") or 0.0), reverse=True)
+        return scored[: max(max_results, 1)]
+
+    async def get_technical_signals(
+        self,
+        ticker: str,
+        timestamp: str | None = None,
+        window: int = 120,
+    ) -> dict[str, Any]:
+        normalized_ts = normalize_timestamp(timestamp)
+        asof_dt = datetime.fromisoformat(normalized_ts).replace(tzinfo=None)
+        symbol = self.kline_db.normalize_ticker(ticker)
+        start_dt = asof_dt - timedelta(days=max(int(window), 20) * 3)
+        rows = self.kline_db.get_kline(symbol, start_dt.strftime("%Y-%m-%d"), asof_dt.strftime("%Y-%m-%d"))
+        if not rows:
+            return {
+                "ticker": ticker,
+                "symbol": symbol,
+                "timestamp": normalized_ts,
+                "source": "local:daily_kline",
+                "signal_status": "no_data",
+            }
+        closes = [float(r.get("close") or 0.0) for r in rows if r.get("close") is not None]
+        if len(closes) < 20:
+            return {
+                "ticker": ticker,
+                "symbol": symbol,
+                "timestamp": normalized_ts,
+                "source": "local:daily_kline",
+                "signal_status": "no_data",
+            }
+        ma5 = sum(closes[-5:]) / 5
+        ma20 = sum(closes[-20:]) / 20
+        trend = "up" if closes[-1] >= ma20 else "down"
+        return {
+            "ticker": ticker,
+            "symbol": symbol,
+            "timestamp": normalized_ts,
+            "source": "local:daily_kline",
+            "signal_status": "ok",
+            "window": min(window, len(closes)),
+            "trend": trend,
+            "signals": {
+                "ma_cross": "golden_cross" if ma5 > ma20 else "death_cross",
+                "macd": "neutral",
+                "rsi": "neutral",
+                "breakout": "none",
+            },
+            "score": 60 if trend == "up" else 40,
+        }
+
+
+class TuShareDataBackend(AShareDataBackend):
+    """TuShare-based backend for A-share data.
+
+    Notes:
+    - Requires `tushare` package and a valid token.
+    - Token can be passed directly or via env `TUSHARE_TOKEN` / `TS_TOKEN`.
+    """
+
+    _rate_limit_lock = asyncio.Lock()
+    _last_call_monotonic = 0.0
+
+    def __init__(self, token: str | None = None):
+        try:
+            import tushare as ts  # type: ignore
+        except Exception as e:
+            raise ImportError(
+                "tushare is not installed. Run `uv add tushare` (or `uv sync` after adding dependency)."
+            ) from e
+
+        resolved_token = (token or os.getenv("TUSHARE_TOKEN") or os.getenv("TS_TOKEN") or "").strip()
+        if not resolved_token:
+            raise ValueError(
+                "TuShare token not configured. Set `tools.tushare_token` in config.yaml "
+                "or env `TUSHARE_TOKEN` / `TS_TOKEN`."
+            )
+
+        self.ts = ts
+        self.pro = ts.pro_api(resolved_token)
+        self.min_interval_seconds = float(os.getenv("TUSHARE_MIN_INTERVAL_SECONDS", "0.35"))
+        self.jitter_seconds = float(os.getenv("TUSHARE_JITTER_SECONDS", "0.15"))
+        self.max_retries = int(os.getenv("TUSHARE_MAX_RETRIES", "2"))
+        self.retry_base_delay = float(os.getenv("TUSHARE_RETRY_BASE_DELAY_SECONDS", "1.5"))
+
+    @staticmethod
+    def _ticker_to_symbol(ticker: str) -> str:
+        ts = ticker.strip().upper()
+        if "." in ts:
+            return ts.split(".")[0]
+        if ts.startswith(("SH", "SZ")):
+            return ts[2:]
+        return ts
+
+    @staticmethod
+    def _ticker_to_ts_code(ticker: str) -> str:
+        ts = ticker.strip().upper()
+        if "." in ts:
+            symbol, suffix = ts.split(".", 1)
+            suffix = suffix.upper()
+            if suffix in {"SH", "SZ"}:
+                return f"{symbol}.{suffix}"
+            return f"{symbol}.SH" if symbol.startswith(("5", "6", "9")) else f"{symbol}.SZ"
+        if ts.startswith(("SH", "SZ")):
+            symbol = ts[2:]
+            suffix = "SH" if ts.startswith("SH") else "SZ"
+            return f"{symbol}.{suffix}"
+        return f"{ts}.SH" if ts.startswith(("5", "6", "9")) else f"{ts}.SZ"
+
+    async def _apply_rate_limit(self) -> None:
+        async with self._rate_limit_lock:
+            now = asyncio.get_running_loop().time()
+            elapsed = now - self._last_call_monotonic
+            required_wait = max(0.0, self.min_interval_seconds - elapsed)
+            if required_wait > 0:
+                await asyncio.sleep(required_wait)
+            if self.jitter_seconds > 0:
+                await asyncio.sleep(random.uniform(0, self.jitter_seconds))
+            self.__class__._last_call_monotonic = asyncio.get_running_loop().time()
+
+    async def _run_tushare_call(self, fn: Any, **kwargs: Any) -> Any:
+        def _call():
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                return fn(**kwargs)
+
+        call_name = getattr(fn, "__name__", str(fn))
+        last_exception: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            await self._apply_rate_limit()
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(_call)
+                elapsed = time.perf_counter() - started
+                logger.info("TuShare call ok: fn=%s elapsed=%.2fs attempt=%s", call_name, elapsed, attempt + 1)
+                return result
+            except Exception as e:
+                last_exception = e
+                elapsed = time.perf_counter() - started
+                logger.warning(
+                    "TuShare call failed: fn=%s elapsed=%.2fs attempt=%s/%s error=%s",
+                    call_name,
+                    elapsed,
+                    attempt + 1,
+                    self.max_retries + 1,
+                    repr(e),
+                )
+                if attempt >= self.max_retries:
+                    break
+                delay = self.retry_base_delay * (2**attempt)
+                if self.jitter_seconds > 0:
+                    delay += random.uniform(0, self.jitter_seconds)
+                logger.info("TuShare retry scheduled: fn=%s next_delay=%.2fs", call_name, delay)
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"TuShare call failed after {self.max_retries + 1} attempts: {last_exception}")
+
+    @staticmethod
+    def _safe_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except Exception:
+                pass
+        try:
+            if value != value:  # noqa: PLR0124
+                return None
+        except Exception:
+            pass
+        return value
+
+    @staticmethod
+    def _to_numeric(df: Any, cols: list[str]) -> Any:
+        for col in cols:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.replace(",", "", regex=False)
+                df[col] = df[col].astype(float)
+        return df
+
+    @staticmethod
+    def _score_desc(series: Any) -> Any:
+        if series is None or len(series) == 0:
+            return series
+        return series.rank(pct=True, method="average")
+
+    @staticmethod
+    def _score_asc(series: Any) -> Any:
+        if series is None or len(series) == 0:
+            return series
+        return (1 - series.rank(pct=True, method="average")).clip(lower=0, upper=1)
+
+    async def get_quote(self, ticker: str, timestamp: str | None = None) -> dict[str, Any]:
+        timestamp = normalize_timestamp(timestamp)
+        asof_dt = datetime.fromisoformat(timestamp).replace(tzinfo=None)
+        trade_date = asof_dt.strftime("%Y%m%d")
+        ts_code = self._ticker_to_ts_code(ticker)
+        symbol = self._ticker_to_symbol(ticker)
+
+        daily_df = await self._run_tushare_call(
+            self.pro.daily,
+            ts_code=ts_code,
+            start_date=trade_date,
+            end_date=trade_date,
+        )
+        if daily_df is None or daily_df.empty:
+            return {"ticker": ticker, "symbol": symbol, "timestamp": timestamp, "source": "tushare:daily", "quote": None}
+
+        row = daily_df.sort_values("trade_date").iloc[-1]
+        quote = {
+            "date": self._safe_value(row.get("trade_date")),
+            "open": self._safe_value(row.get("open")),
+            "high": self._safe_value(row.get("high")),
+            "low": self._safe_value(row.get("low")),
+            "close": self._safe_value(row.get("close")),
+            "volume": self._safe_value(row.get("vol")),
+            "amount": self._safe_value(row.get("amount")),
+            "turnover_rate": None,
+        }
+        return {
+            "ticker": ticker,
+            "symbol": symbol,
+            "timestamp": timestamp,
+            "source": "tushare:daily",
+            "quote": quote,
+        }
+
+    async def get_fundamentals(self, ticker: str, timestamp: str | None = None, period: str = "ttm") -> dict[str, Any]:
+        # Keep fundamentals path on AkShare for now; caller will fallback if needed.
+        raise NotImplementedError("TuShare fundamentals path is not wired yet.")
+
+    async def get_news(self, timestamp: str | None = None, ticker: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        # Keep news path on AkShare for now; caller will fallback if needed.
+        raise NotImplementedError("TuShare news path is not wired yet.")
+
+    async def get_technical_signals(self, ticker: str, timestamp: str | None = None, window: int = 120) -> dict[str, Any]:
+        # Keep technical path on AkShare for now; caller will fallback if needed.
+        raise NotImplementedError("TuShare technical signals path is not wired yet.")
+
+    async def screen_stocks(self, strategy: str, timestamp: str | None = None, max_results: int = 20) -> list[dict[str, Any]]:
+        timestamp = normalize_timestamp(timestamp)
+        asof_dt = datetime.fromisoformat(timestamp).replace(tzinfo=None)
+        trade_date = asof_dt.strftime("%Y%m%d")
+
+        stock_basic_df = await self._run_tushare_call(
+            self.pro.stock_basic,
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name",
+        )
+        daily_df = await self._run_tushare_call(
+            self.pro.daily,
+            trade_date=trade_date,
+            fields="ts_code,open,high,low,close,pct_chg,vol,amount",
+        )
+        daily_basic_df = await self._run_tushare_call(
+            self.pro.daily_basic,
+            trade_date=trade_date,
+            fields="ts_code,turnover_rate,pe,pb,total_mv",
+        )
+        if daily_df is None or daily_df.empty or daily_basic_df is None or daily_basic_df.empty:
+            return []
+
+        import pandas as pd  # type: ignore
+
+        df = daily_df.merge(daily_basic_df, on="ts_code", how="left")
+        if stock_basic_df is not None and not stock_basic_df.empty:
+            df = df.merge(stock_basic_df[["ts_code", "name", "symbol"]], on="ts_code", how="left")
+        else:
+            df["symbol"] = df["ts_code"].astype(str).str.split(".").str[0]
+            df["name"] = df["symbol"]
+
+        # Align TuShare fields to existing strategy pipeline field names.
+        df["代码"] = df.get("symbol")
+        df["名称"] = df.get("name")
+        df["最新价"] = df.get("close")
+        df["涨跌幅"] = df.get("pct_chg")
+        df["换手率"] = df.get("turnover_rate")
+        if {"high", "low", "close"}.issubset(df.columns):
+            base = df["close"].replace(0, pd.NA).abs()
+            df["振幅"] = ((df["high"] - df["low"]).abs() / base * 100).fillna(0)
+        else:
+            df["振幅"] = 0.0
+        df["市盈率-动态"] = df.get("pe")
+        df["市净率"] = df.get("pb")
+        df["总市值"] = df.get("total_mv")
+        # TuShare amount for daily is usually in 千元; normalize to 元 for filter consistency.
+        df["成交额"] = pd.to_numeric(df.get("amount"), errors="coerce") * 1000
+
+        df = self._to_numeric(df, ["最新价", "涨跌幅", "换手率", "振幅", "市盈率-动态", "市净率", "总市值", "成交额"])
+
+        before = len(df)
+        if "名称" in df.columns:
+            df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
+        if "代码" in df.columns:
+            df = df[~df["代码"].astype(str).str.startswith(("4", "8"))]
+        if "最新价" in df.columns:
+            df = df[df["最新价"] > 0]
+        if "成交额" in df.columns:
+            df = df[df["成交额"] >= 2e8]
+        if "总市值" in df.columns:
+            df = df[df["总市值"] >= 8e9]
+        if "换手率" in df.columns:
+            df = df[(df["换手率"] >= 0.1) & (df["换手率"] <= 15)]
+        logger.info("TuShare screen layer1 tradability: before=%s after=%s removed=%s", before, len(df), before - len(df))
+
+        if df.empty:
+            return []
+
+        before = len(df)
+        if strategy == "quality":
+            if {"市盈率-动态", "市净率"}.issubset(df.columns):
+                df = df[(df["市盈率-动态"] > 0) & (df["市盈率-动态"] <= 40) & (df["市净率"] <= 6)]
+        elif strategy == "dividend":
+            if {"市盈率-动态", "市净率", "总市值"}.issubset(df.columns):
+                df = df[(df["市盈率-动态"] > 0) & (df["市盈率-动态"] <= 25) & (df["市净率"] <= 3.5) & (df["总市值"] >= 2e10)]
+        elif strategy == "low_vol":
+            if {"振幅", "换手率"}.issubset(df.columns):
+                df = df[(df["振幅"] <= 6) & (df["换手率"] <= 8)]
+        elif strategy == "value":
+            if {"市盈率-动态", "市净率"}.issubset(df.columns):
+                df = df[(df["市盈率-动态"] > 0) & (df["市盈率-动态"] <= 22) & (df["市净率"] <= 2.8)]
+        logger.info(
+            "TuShare screen layer2 strategy_filter: strategy=%s before=%s after=%s removed=%s",
+            strategy,
+            before,
+            len(df),
+            before - len(df),
+        )
+
+        if df.empty:
+            return []
+
+        score_cols = []
+        if "总市值" in df.columns:
+            df["score_size"] = self._score_desc(df["总市值"])
+            score_cols.append("score_size")
+        if "成交额" in df.columns:
+            df["score_liquidity"] = self._score_desc(df["成交额"])
+            score_cols.append("score_liquidity")
+        if "市盈率-动态" in df.columns:
+            pe = df["市盈率-动态"].where(df["市盈率-动态"] > 0, other=df["市盈率-动态"].median())
+            df["score_pe"] = self._score_asc(pe)
+            score_cols.append("score_pe")
+        if "市净率" in df.columns:
+            pb = df["市净率"].where(df["市净率"] > 0, other=df["市净率"].median())
+            df["score_pb"] = self._score_asc(pb)
+            score_cols.append("score_pb")
+        if "振幅" in df.columns:
+            df["score_volatility"] = self._score_asc(df["振幅"])
+            score_cols.append("score_volatility")
+        if "换手率" in df.columns:
+            centered = (df["换手率"] - 2.5).abs()
+            df["score_turnover"] = self._score_asc(centered)
+            score_cols.append("score_turnover")
+        if "涨跌幅" in df.columns:
+            momentum_risk = df["涨跌幅"].abs()
+            df["score_momentum_stability"] = self._score_asc(momentum_risk)
+            score_cols.append("score_momentum_stability")
+
+        weights_map = {
+            "quality": {
+                "score_size": 0.18,
+                "score_liquidity": 0.20,
+                "score_pe": 0.16,
+                "score_pb": 0.16,
+                "score_volatility": 0.14,
+                "score_turnover": 0.10,
+                "score_momentum_stability": 0.06,
+            },
+            "dividend": {
+                "score_size": 0.22,
+                "score_liquidity": 0.20,
+                "score_pe": 0.22,
+                "score_pb": 0.20,
+                "score_volatility": 0.10,
+                "score_turnover": 0.06,
+            },
+            "low_vol": {
+                "score_size": 0.15,
+                "score_liquidity": 0.18,
+                "score_volatility": 0.30,
+                "score_turnover": 0.17,
+                "score_momentum_stability": 0.20,
+            },
+            "value": {
+                "score_size": 0.14,
+                "score_liquidity": 0.18,
+                "score_pe": 0.30,
+                "score_pb": 0.28,
+                "score_volatility": 0.06,
+                "score_momentum_stability": 0.04,
+            },
+        }
+        weights = weights_map.get(strategy, weights_map["quality"])
+        effective_weights = {k: v for k, v in weights.items() if k in score_cols}
+        if not effective_weights:
+            return []
+
+        total_weight = sum(effective_weights.values())
+        normalized_weights = {k: (v / total_weight) for k, v in effective_weights.items()}
+        df["total_score"] = 0.0
+        for col, w in normalized_weights.items():
+            df["total_score"] = df["total_score"] + df[col] * w
+
+        df = df.sort_values("total_score", ascending=False)
+        top_df = df.head(max(max_results, 1))
+
+        rows = []
+        for _, row in top_df.iterrows():
+            factor_scores = {k: round(float(row.get(k, 0.0)), 4) for k in normalized_weights}
+            rows.append(
+                {
+                    "代码": self._safe_value(row.get("代码")),
+                    "名称": self._safe_value(row.get("名称")),
+                    "最新价": self._safe_value(row.get("最新价")),
+                    "涨跌幅": self._safe_value(row.get("涨跌幅")),
+                    "换手率": self._safe_value(row.get("换手率")),
+                    "振幅": self._safe_value(row.get("振幅")),
+                    "市盈率-动态": self._safe_value(row.get("市盈率-动态")),
+                    "市净率": self._safe_value(row.get("市净率")),
+                    "总市值": self._safe_value(row.get("总市值")),
+                    "成交额": self._safe_value(row.get("成交额")),
+                    "strategy": strategy,
+                    "total_score": round(float(row.get("total_score", 0.0)), 4),
+                    "factor_scores": factor_scores,
+                    "timestamp": timestamp,
+                    "screen_note": "multi-layer screening: tradability filter + style constraints + weighted factor score (TuShare snapshot).",
+                }
+            )
+        return rows
 
 
 class AkShareDataBackend(AShareDataBackend):
@@ -430,6 +1056,202 @@ class AkShareDataBackend(AShareDataBackend):
 
         return [self._row_to_dict(row) for _, row in news_df.head(max(limit, 1)).iterrows()]
 
+    async def get_technical_signals(
+        self,
+        ticker: str,
+        timestamp: str | None = None,
+        window: int = 120,
+    ) -> dict[str, Any]:
+        timestamp = normalize_timestamp(timestamp)
+        symbol = self._ticker_to_symbol(ticker)
+        asof_dt = datetime.fromisoformat(timestamp).replace(tzinfo=None)
+        lookback_days = max(int(window), 120) + 120
+        start_dt = asof_dt - timedelta(days=lookback_days)
+
+        hist_df = await self._run_akshare_call(
+            self.ak.stock_zh_a_hist,
+            symbol=symbol,
+            period="daily",
+            start_date=start_dt.strftime("%Y%m%d"),
+            end_date=asof_dt.strftime("%Y%m%d"),
+            adjust="",
+        )
+        if hist_df is None or hist_df.empty:
+            return {
+                "ticker": ticker,
+                "symbol": symbol,
+                "timestamp": timestamp,
+                "source": "akshare:stock_zh_a_hist",
+                "signal_status": "no_data",
+            }
+
+        df = self._asof_filter(hist_df, timestamp)
+        if df is None or df.empty:
+            return {
+                "ticker": ticker,
+                "symbol": symbol,
+                "timestamp": timestamp,
+                "source": "akshare:stock_zh_a_hist",
+                "signal_status": "no_data_as_of",
+            }
+
+        import pandas as pd  # type: ignore
+
+        work = df.copy()
+        for col in ("开盘", "最高", "最低", "收盘"):
+            if col in work.columns:
+                work[col] = pd.to_numeric(work[col], errors="coerce")
+        work = work.dropna(subset=["收盘"])
+        if len(work) < 35:
+            return {
+                "ticker": ticker,
+                "symbol": symbol,
+                "timestamp": timestamp,
+                "source": "akshare:stock_zh_a_hist",
+                "signal_status": "insufficient_data",
+                "available_rows": int(len(work)),
+            }
+
+        close = work["收盘"]
+        high = work["最高"] if "最高" in work.columns else close
+        low = work["最低"] if "最低" in work.columns else close
+
+        ma5 = close.rolling(5).mean()
+        ma10 = close.rolling(10).mean()
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        dif = ema12 - ema26
+        dea = dif.ewm(span=9, adjust=False).mean()
+        macd_hist = (dif - dea) * 2
+
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, pd.NA)
+        rsi14 = 100 - (100 / (1 + rs))
+
+        prev_close = close.shift(1)
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr14 = tr.rolling(14).mean()
+
+        support_20 = low.tail(20).min() if len(low) >= 20 else low.min()
+        resistance_20 = high.tail(20).max() if len(high) >= 20 else high.max()
+        support_60 = low.tail(60).min() if len(low) >= 60 else low.min()
+        resistance_60 = high.tail(60).max() if len(high) >= 60 else high.max()
+
+        latest_close = float(close.iloc[-1])
+        latest_ma20 = float(ma20.iloc[-1]) if pd.notna(ma20.iloc[-1]) else latest_close
+        latest_ma60 = float(ma60.iloc[-1]) if pd.notna(ma60.iloc[-1]) else latest_ma20
+        latest_dif = float(dif.iloc[-1]) if pd.notna(dif.iloc[-1]) else 0.0
+        latest_dea = float(dea.iloc[-1]) if pd.notna(dea.iloc[-1]) else 0.0
+        latest_rsi14 = float(rsi14.iloc[-1]) if pd.notna(rsi14.iloc[-1]) else 50.0
+        latest_atr14 = float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else 0.0
+        latest_macd_hist = float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else 0.0
+
+        ma_cross = "neutral"
+        if len(ma5) >= 2 and len(ma20) >= 2:
+            prev_diff = ma5.iloc[-2] - ma20.iloc[-2]
+            curr_diff = ma5.iloc[-1] - ma20.iloc[-1]
+            if pd.notna(prev_diff) and pd.notna(curr_diff):
+                if prev_diff <= 0 < curr_diff:
+                    ma_cross = "golden_cross"
+                elif prev_diff >= 0 > curr_diff:
+                    ma_cross = "death_cross"
+
+        macd_signal = "neutral"
+        if latest_dif > latest_dea and latest_macd_hist > 0:
+            macd_signal = "bullish"
+        elif latest_dif < latest_dea and latest_macd_hist < 0:
+            macd_signal = "bearish"
+
+        rsi_signal = "neutral"
+        if latest_rsi14 >= 70:
+            rsi_signal = "overbought"
+        elif latest_rsi14 <= 30:
+            rsi_signal = "oversold"
+
+        breakout = "none"
+        if latest_close > float(resistance_20) * 1.001:
+            breakout = "bullish_breakout"
+        elif latest_close < float(support_20) * 0.999:
+            breakout = "bearish_breakdown"
+
+        if latest_close >= latest_ma20 >= latest_ma60:
+            trend = "up"
+        elif latest_close <= latest_ma20 <= latest_ma60:
+            trend = "down"
+        else:
+            trend = "sideways"
+
+        score = 50
+        if trend == "up":
+            score += 15
+        elif trend == "down":
+            score -= 15
+
+        if ma_cross == "golden_cross":
+            score += 10
+        elif ma_cross == "death_cross":
+            score -= 10
+
+        if macd_signal == "bullish":
+            score += 10
+        elif macd_signal == "bearish":
+            score -= 10
+
+        if rsi_signal == "oversold":
+            score += 5
+        elif rsi_signal == "overbought":
+            score -= 5
+
+        if breakout == "bullish_breakout":
+            score += 8
+        elif breakout == "bearish_breakdown":
+            score -= 8
+
+        score = max(0, min(100, int(score)))
+
+        return {
+            "ticker": ticker,
+            "symbol": symbol,
+            "timestamp": timestamp,
+            "source": "akshare:stock_zh_a_hist",
+            "signal_status": "ok",
+            "window": int(window),
+            "trend": trend,
+            "signals": {
+                "ma_cross": ma_cross,
+                "macd": macd_signal,
+                "rsi": rsi_signal,
+                "breakout": breakout,
+            },
+            "levels": {
+                "support_20": round(float(support_20), 4),
+                "resistance_20": round(float(resistance_20), 4),
+                "support_60": round(float(support_60), 4),
+                "resistance_60": round(float(resistance_60), 4),
+            },
+            "score": score,
+            "raw": {
+                "close": round(latest_close, 4),
+                "ma5": round(float(ma5.iloc[-1]), 4) if pd.notna(ma5.iloc[-1]) else None,
+                "ma10": round(float(ma10.iloc[-1]), 4) if pd.notna(ma10.iloc[-1]) else None,
+                "ma20": round(latest_ma20, 4),
+                "ma60": round(latest_ma60, 4),
+                "dif": round(latest_dif, 6),
+                "dea": round(latest_dea, 6),
+                "macd_hist": round(latest_macd_hist, 6),
+                "rsi14": round(latest_rsi14, 4),
+                "atr14": round(latest_atr14, 4),
+            },
+        }
+
     async def screen_stocks(self, strategy: str, timestamp: str | None = None, max_results: int = 20) -> list[dict[str, Any]]:
         timestamp = normalize_timestamp(timestamp)
         # Use Playwright snapshot as primary source (with anti-ban rate limiting).
@@ -604,6 +1426,71 @@ class AkShareDataBackend(AShareDataBackend):
         return rows
 
 
+class PreferredAShareDataBackend(AShareDataBackend):
+    """Preferred backend chain: TuShare first, AkShare fallback."""
+
+    def __init__(self, primary: AShareDataBackend, fallback: AShareDataBackend):
+        self.primary = primary
+        self.fallback = fallback
+
+    @staticmethod
+    def _is_empty_result(method_name: str, payload: Any) -> bool:
+        if payload is None:
+            return True
+        if method_name == "get_quote" and isinstance(payload, dict):
+            return payload.get("quote") is None
+        if method_name == "screen_stocks" and isinstance(payload, list):
+            return len(payload) == 0
+        if method_name == "get_news" and isinstance(payload, list):
+            return len(payload) == 0
+        if method_name == "get_fundamentals" and isinstance(payload, dict):
+            return payload.get("financial_indicator") is None and payload.get("valuation_indicator") is None
+        if method_name == "get_technical_signals" and isinstance(payload, dict):
+            status = str(payload.get("signal_status") or "").lower()
+            return status.startswith("no_data")
+        return False
+
+    async def _call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        primary_method = getattr(self.primary, method_name)
+        fallback_method = getattr(self.fallback, method_name)
+        try:
+            primary_result = await primary_method(*args, **kwargs)
+            if self._is_empty_result(method_name, primary_result):
+                logger.warning(
+                    "Primary stock backend returned empty payload, fallback to secondary: method=%s",
+                    method_name,
+                )
+                return await fallback_method(*args, **kwargs)
+            return primary_result
+        except Exception as exc:
+            logger.warning(
+                "Primary stock backend failed, fallback to secondary: method=%s error=%s",
+                method_name,
+                repr(exc),
+            )
+            return await fallback_method(*args, **kwargs)
+
+    async def get_quote(self, ticker: str, timestamp: str | None = None) -> dict[str, Any]:
+        return await self._call("get_quote", ticker=ticker, timestamp=timestamp)
+
+    async def get_fundamentals(self, ticker: str, timestamp: str | None = None, period: str = "ttm") -> dict[str, Any]:
+        return await self._call("get_fundamentals", ticker=ticker, timestamp=timestamp, period=period)
+
+    async def get_news(self, timestamp: str | None = None, ticker: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        return await self._call("get_news", timestamp=timestamp, ticker=ticker, limit=limit)
+
+    async def screen_stocks(self, strategy: str, timestamp: str | None = None, max_results: int = 20) -> list[dict[str, Any]]:
+        return await self._call("screen_stocks", strategy=strategy, timestamp=timestamp, max_results=max_results)
+
+    async def get_technical_signals(
+        self,
+        ticker: str,
+        timestamp: str | None = None,
+        window: int = 120,
+    ) -> dict[str, Any]:
+        return await self._call("get_technical_signals", ticker=ticker, timestamp=timestamp, window=window)
+
+
 class AShareQuoteTool(Tool):
     """Get real-time or latest quote data for a ticker."""
 
@@ -752,7 +1639,7 @@ class AShareScreenTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Screen A-share candidates using conservative strategies (quality, dividend, low_vol, value)."
+        return "使用保守策略筛选A股候选股票（quality、dividend、low_vol、value）。"
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -761,17 +1648,17 @@ class AShareScreenTool(Tool):
             "properties": {
                 "timestamp": {
                     "type": "string",
-                    "description": "Optional analysis time in ISO 8601. If omitted, realtime mode is used.",
+                    "description": "可选分析时点（ISO 8601）。不传则使用实时模式。",
                 },
                 "strategy": {
                     "type": "string",
-                    "description": "Screening strategy.",
+                    "description": "筛选策略。",
                     "enum": ["quality", "dividend", "low_vol", "value"],
                     "default": "quality",
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Max number of candidate stocks.",
+                    "description": "返回候选股票的最大数量。",
                     "default": 20,
                 },
             },
@@ -786,6 +1673,53 @@ class AShareScreenTool(Tool):
             return ToolResult(success=False, content="", error=str(e))
         except Exception as e:
             return ToolResult(success=False, content="", error=f"Failed to screen stocks: {e}")
+
+
+class AShareTechnicalSignalsTool(Tool):
+    """Generate technical signals for one A-share ticker."""
+
+    def __init__(self, backend: AShareDataBackend):
+        self.backend = backend
+
+    @property
+    def name(self) -> str:
+        return "get_a_share_technical_signals"
+
+    @property
+    def description(self) -> str:
+        return "生成A股技术信号（趋势、均线、MACD、RSI、突破、支撑阻力）。"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "A股代码，例如 600519.SH 或 000001.SZ",
+                },
+                "timestamp": {
+                    "type": "string",
+                    "description": "可选分析时点（ISO 8601）。不传则使用实时模式。",
+                },
+                "window": {
+                    "type": "integer",
+                    "description": "技术分析窗口（交易日），默认 120。",
+                    "default": 120,
+                },
+            },
+            "required": ["ticker"],
+        }
+
+    async def execute(self, ticker: str, timestamp: str | None = None, window: int = 120) -> ToolResult:
+        try:
+            normalized_ts = normalize_timestamp(timestamp)
+            data = await self.backend.get_technical_signals(ticker=ticker, timestamp=normalized_ts, window=window)
+            return ToolResult(success=True, content=json.dumps(data, ensure_ascii=False, indent=2))
+        except NotImplementedError as e:
+            return ToolResult(success=False, content="", error=str(e))
+        except Exception as e:
+            return ToolResult(success=False, content="", error=f"Failed to get technical signals: {e}")
 
 
 class ConservativeTradePlanTool(Tool):
@@ -894,23 +1828,56 @@ class ConservativeTradePlanTool(Tool):
             return ToolResult(success=False, content="", error=f"Failed to build trade plan: {e}")
 
 
-def create_a_share_tools(backend: AShareDataBackend | None = None) -> list[Tool]:
+def create_a_share_tools(
+    backend: AShareDataBackend | None = None,
+    tushare_token: str | None = None,
+    kline_db_path: str | None = None,
+) -> list[Tool]:
     """Create all A-share related tools.
 
     Args:
         backend: Optional concrete backend implementation. If omitted,
             PlaceholderAShareDataBackend is used.
+        tushare_token: Optional TuShare token from config; env variables still supported as fallback.
     """
     # 统一入口：后续只需替换 backend，不需要改 Agent 或 CLI 组装逻辑。
     if backend is not None:
         data_backend = backend
     else:
+        local_backend = LocalAShareDataBackend(db_path=kline_db_path or str(DEFAULT_MEMORY_DB_PATH))
         try:
-            data_backend = AkShareDataBackend()
+            ak_backend = AkShareDataBackend()
         except ImportError:
-            data_backend = PlaceholderAShareDataBackend()
+            ak_backend = None
+
+        tushare_backend = None
+        try:
+            # Prefer TuShare when token is configured.
+            token = (tushare_token or "").strip() or None
+            if token is None:
+                tushare_backend = TuShareDataBackend()
+            else:
+                tushare_backend = TuShareDataBackend(token=token)
+            logger.info("A-share backend selected: TuShare primary")
+        except Exception as exc:
+            logger.warning("TuShare backend unavailable, skip primary: %s", exc)
+
+        if tushare_backend is not None and ak_backend is not None:
+            remote_backend = PreferredAShareDataBackend(primary=tushare_backend, fallback=ak_backend)
+            data_backend = PreferredAShareDataBackend(primary=local_backend, fallback=remote_backend)
+            logger.info("A-share backend mode: preferred chain (Local -> TuShare -> AkShare)")
+        elif tushare_backend is not None:
+            data_backend = PreferredAShareDataBackend(primary=local_backend, fallback=tushare_backend)
+            logger.info("A-share backend mode: preferred chain (Local -> TuShare)")
+        elif ak_backend is not None:
+            data_backend = PreferredAShareDataBackend(primary=local_backend, fallback=ak_backend)
+            logger.info("A-share backend mode: preferred chain (Local -> AkShare)")
+        else:
+            data_backend = local_backend
+            logger.warning("A-share backend mode: Local only (no TuShare/AkShare available)")
     return [
         AShareScreenTool(data_backend),
+        AShareTechnicalSignalsTool(data_backend),
         AShareQuoteTool(data_backend),
         AShareFundamentalsTool(data_backend),
         AShareNewsTool(data_backend),

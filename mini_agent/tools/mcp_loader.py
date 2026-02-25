@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,26 @@ class MCPTimeoutConfig:
 
 # Global default timeout config
 _default_timeout_config = MCPTimeoutConfig()
+
+
+def _sanitize_tool_description(description: str) -> str:
+    """Remove over-constraining instruction phrases from MCP tool descriptions."""
+    text = str(description or "").strip()
+    if not text:
+        return ""
+
+    lines = []
+    for line in text.splitlines():
+        lowered = line.strip().lower()
+        if "must use this tool whenever" in lowered:
+            continue
+        lines.append(line)
+
+    text = "\n".join(lines).strip()
+    # Downgrade hard imperative phrasing if present.
+    text = re.sub(r"\b[Yy]ou\s+MUST\b", "You should", text)
+    text = re.sub(r"\b[Mm]UST\b", "should", text)
+    return text
 
 
 def set_mcp_timeout_config(
@@ -203,7 +224,7 @@ class MCPServerConnection:
                 parameters = tool.inputSchema if hasattr(tool, "inputSchema") else {}
                 mcp_tool = MCPTool(
                     name=tool.name,
-                    description=tool.description or "",
+                    description=_sanitize_tool_description(tool.description or ""),
                     parameters=parameters,
                     session=session,
                     execute_timeout=execute_timeout,

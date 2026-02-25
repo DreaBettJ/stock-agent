@@ -47,12 +47,11 @@ class AgentLogger:
         if self.log_file is not None and self.intercept_log_file is not None and not force_new:
             return False
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         sid = self.session_id or "unknown"
         # Keep file names simple and filesystem-safe.
         sid = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in sid)
-        log_filename = f"agent_run_s{sid}_{timestamp}.log"
-        intercept_filename = f"agent_intercept_s{sid}_{timestamp}.jsonl"
+        log_filename = f"agent_run_s{sid}.log"
+        intercept_filename = f"agent_intercept_s{sid}.jsonl"
         self.log_file = self.log_dir / log_filename
         self.intercept_log_file = self.log_dir / intercept_filename
         self.log_index = 0

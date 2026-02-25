@@ -76,16 +76,57 @@ mini-agent session start 1
 
 ```bash
 mini-agent sync 600519,000001 --start 2020-01-01
-mini-agent sync --all --start 1991-01-01
+mini-agent sync --all   # 默认当日增量同步（需 config.yaml 配置 tools.tushare_token）
 mini-agent sync --cron
 ```
+
+### 5.4.1 配置 cron（每日自动运行）
+
+推荐两种方式：
+
+1. 自动安装（推荐）
+
+```bash
+mini-agent sync --install-cron
+crontab -l
+```
+
+会写入两条工作日任务：
+
+- `16:00`：同步当日行情（`mini-agent sync --all --start ...`）
+- `16:05`：触发每日复盘事件（`mini-agent event trigger daily_review --all`）
+
+2. 手工安装（自定义时间/命令时使用）
+
+```bash
+crontab -e
+```
+
+加入（示例，按你的项目绝对路径修改）：
+
+```cron
+0 16 * * 1-5 cd /home/lijiang/workspace/Mini-Agent && mini-agent sync --all
+5 16 * * 1-5 cd /home/lijiang/workspace/Mini-Agent && mini-agent event trigger daily_review --all
+```
+
+验收与排查：
+
+```bash
+crontab -l
+mini-agent session list   # 确认有在线 session，否则 --all 可能没有目标
+```
+
+注意：
+
+- `event trigger --all` 只会投递给“在线”session（有运行中的 CLI runtime）。
+- 生产建议用绝对路径命令（如 `uv run python -m mini_agent.cli ...`）避免 PATH 差异导致 cron 找不到 `mini-agent`。
 
 ### 5.5 事件触发
 
 ```bash
 mini-agent event trigger daily_review --session 1
 mini-agent event trigger daily_review --all
-mini-agent event trigger daily_review --session 1
+mini-agent event trigger daily_review --session 1 --debug  # 调试模式：强制唯一 event_id，跳过重复拦截
 ```
 
 ### 5.6 模拟交易
@@ -101,6 +142,7 @@ mini-agent trade profit --session 1
 
 ```bash
 mini-agent backtest run --session 1 --start 2024-01-01 --end 2024-12-31
+mini-agent backtest run --session 1 --start 2024-01-01 --end 2024-12-31 --gate
 mini-agent backtest result --session 1
 ```
 
@@ -118,6 +160,43 @@ mini-agent backtest result --session 1
   - 广播或单点触发；默认会启用 LLM 决策与模拟下单。
 - `sync`
   - 将 A 股日线写入 `daily_kline`，供 `trade/backtest/event` 共用。
+
+---
+
+## 6.1 决策协议（JSON 优先）
+
+- `daily_review` 要求 LLM 优先输出 JSON：
+  - `decision`: `trade | hold`
+  - `actions[]`: `action/ticker/quantity/trade_date/reason`
+- 系统兼容旧协议（`买入:代码,数量`、`不操作`），但建议只用 JSON。
+- 自动执行时会按 `actions[]` 顺序逐条落单，结果写入执行结果列表。
+
+---
+
+## 6.2 数据自愈
+
+- 决策前先检查目标交易日在 `daily_kline` 是否有数据。
+- 若缺失且配置了 `tools.tushare_token`，系统会自动尝试单日批量同步。
+- 若仍无数据，`daily_review` 回退到最近可用交易日。
+
+---
+
+## 6.3 关键记忆落库规则
+
+- 会记录：`buy/sell/failed/planned` 相关操作。
+- 默认不记录：`hold/no_trade`，避免噪音污染。
+- 聊天模式下 agent 直接调用 `simulate_trade` 的结果也会写入 `critical_memories`。
+
+---
+
+## 6.4 回测门禁
+
+- `--gate` 开启后会检查：
+  - `--gate-min-trades`
+  - `--gate-min-win-rate`
+  - `--gate-max-drawdown`
+  - `--gate-min-profit-factor`
+- 门禁失败退出码为 `2`，可接 CI。
 
 ---
 

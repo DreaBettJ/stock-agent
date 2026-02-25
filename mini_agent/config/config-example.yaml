@@ -46,6 +46,7 @@ tools:
   enable_bash: true        # Bash command execution tool
   enable_note: true        # Session note tool (SessionNoteTool)
   enable_stock_tools: true # A-share stock tools (screen/quote/fundamentals/news/trade-plan skeleton)
+  tushare_token: ""        # TuShare token (preferred stock data source). Leave empty to fallback to env/akshare.
   
   # Claude Skills
   enable_skills: true      # Enable Skills
