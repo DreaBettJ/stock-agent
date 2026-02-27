@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import shlex
 import subprocess
 import sqlite3
 
@@ -246,9 +247,14 @@ def sync_kline_data(
 
 def build_cron_lines(cwd: Path, start: str | None = None) -> list[str]:
     _ = start
+    cwd_abs = cwd.resolve()
+    cwd_q = shlex.quote(str(cwd_abs))
+    venv_cli = cwd_abs / ".venv" / "bin" / "big-a-helper"
+    cli_cmd = shlex.quote(str(venv_cli)) if venv_cli.exists() else "big-a-helper"
+    cron_log = "/tmp/big_a_helper_cron.log"
     return [
-        f"0 16 * * 1-5 cd {cwd} && big-a-helper sync --all",
-        f"5 16 * * 1-5 cd {cwd} && big-a-helper event trigger daily_review --all",
+        f"0 16 * * 1-5 cd {cwd_q} && {cli_cmd} sync --all >> {cron_log} 2>&1",
+        f"5 16 * * 1-5 cd {cwd_q} && {cli_cmd} event trigger daily_review --all >> {cron_log} 2>&1",
     ]
 
 
