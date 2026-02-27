@@ -216,6 +216,28 @@ async def test_simulate_trade_tool_allows_kechuang_buy_when_permission_enabled(t
 
 
 @pytest.mark.asyncio
+async def test_simulate_trade_tool_rejects_market_index_ticker(tmp_path: Path):
+    db_path = tmp_path / "sim_index_block.db"
+    manager = SessionManager(db_path=str(db_path))
+    session_id = manager.create_session(name="sim-index-block", system_prompt="p", mode="simulation", initial_capital=100000)
+    kline = KLineDB(db_path=str(db_path))
+    # Even if kline data exists, index ticker should be blocked as non-tradable.
+    kline.upsert_daily_kline("000001", "2024-01-02", 10.0, 10.8, 9.9, 10.5, 1000, 10000)
+    kline.upsert_daily_kline("000001", "2024-01-03", 11.0, 11.2, 10.8, 11.1, 1000, 11000)
+
+    tool = SimulateTradeTool(db_path=str(db_path))
+    result = await tool.execute(
+        session_id=session_id,
+        action="buy",
+        ticker="000001",
+        quantity=100,
+        trade_date="2024-01-02",
+    )
+    assert result.success is False
+    assert "not tradable" in str(result.error)
+
+
+@pytest.mark.asyncio
 async def test_event_broadcaster_filters_sessions(tmp_path: Path):
     db_path = tmp_path / "event.db"
     manager = SessionManager(db_path=str(db_path))

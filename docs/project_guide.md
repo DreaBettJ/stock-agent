@@ -217,3 +217,73 @@ uv run pytest tests/test_stock_core_modules.py tests/test_backtest.py tests/test
 ```
 
 如果要扩展功能，优先在 `mini_agent/app/` 新增服务，不要先改 `cli.py`。
+
+---
+
+## 9. AI能力边界实验（Strict vs Loose）
+
+如果你在做“约束强度 vs AI自主性”的边界测试，直接参考：
+
+- `docs/dual_track_experiment.md`
+- `scripts/create_dual_track_sessions.sh`
+
+---
+
+## 10. 批量策略后台实验（2~4周）
+
+如果你想“遍历策略模板 + 后台常驻运行 + 周期观察结果”，使用：
+
+- `scripts/strategy_lab_runner.sh`
+
+### 10.1 一键创建并后台启动（tmux）
+
+```bash
+cd /home/lijiang/workspace/Mini-Agent
+bash scripts/strategy_lab_runner.sh up
+```
+
+该命令会：
+
+1. 从 `docs/strategy_templates.md` 自动提取所有模板编号
+2. 为每个模板创建一个 simulation session（统一风险参数）
+3. 将所有 session 以 `tmux` 多窗口方式后台运行
+4. 记录映射到 `.strategy_lab_sessions`（session_id / template_id / session_name）
+
+### 10.2 日常触发（建议工作日）
+
+```bash
+bash scripts/strategy_lab_runner.sh trigger
+```
+
+该命令等价于：
+
+```bash
+uv run python -m mini_agent.cli event trigger daily_review --all
+```
+
+### 10.3 查看状态
+
+```bash
+bash scripts/strategy_lab_runner.sh status
+```
+
+### 10.4 停止后台
+
+```bash
+bash scripts/strategy_lab_runner.sh stop
+```
+
+### 10.5 2~4周后对比建议
+
+按 `.strategy_lab_sessions` 中的 session_id，逐个查看：
+
+```bash
+uv run python -m mini_agent.cli trade profit --session <session_id>
+uv run python -m mini_agent.cli trade action-logs --session <session_id> --limit 50
+```
+
+重点比较：
+
+- 最大回撤是否可接受
+- 胜率和盈亏比是否稳定
+- 信号是否可执行（是否明确到动作/仓位/失效条件）

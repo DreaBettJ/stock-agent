@@ -155,7 +155,8 @@ class TestAutoTradingWorkflow:
 
         assert "Test strategy block" in system_prompt
         assert "【执行约束】" in system_prompt
-        assert "simulate_trade" in system_prompt
+        assert "严禁调用任何交易执行工具" in system_prompt
+        assert "只能输出结构化决策 JSON" in system_prompt
 
     @pytest.mark.asyncio
     async def test_build_technical_signals_for_market(self, setup_workflow):
@@ -341,15 +342,25 @@ class TestAutoTradingWorkflow:
         assert logs[0]["action"] == "buy"
 
     @pytest.mark.asyncio
-    async def test_trigger_daily_review_records_tool_error_with_generic_message(self, setup_workflow):
+    async def test_trigger_daily_review_ignores_agent_tool_messages(self, setup_workflow):
         workflow = setup_workflow["workflow"]
         manager = setup_workflow["manager"]
         sid = setup_workflow["session_id"]
 
+        class _ExecResult:
+            success = True
+            content = "SIM_TRADE_OK id=2 action=buy ticker=600519 qty=100"
+            error = None
+
+        trade_executor = MagicMock()
+        trade_executor.execute = AsyncMock(return_value=_ExecResult())
+
         with patch("mini_agent.auto_trading.LLMClient"):
             with patch("mini_agent.auto_trading.Agent") as mock_agent:
                 mock_agent_instance = MagicMock()
-                mock_agent_instance.run = AsyncMock(return_value='{"decision":"hold","actions":[]}')
+                mock_agent_instance.run = AsyncMock(
+                    return_value='{"decision":"trade","actions":[{"action":"buy","ticker":"600519","quantity":100,"reason":"from_json"}]}'
+                )
                 mock_agent_instance.messages = [
                     MagicMock(role="tool", name="simulate_trade", content="Error: quantity must be > 0")
                 ]
@@ -360,19 +371,19 @@ class TestAutoTradingWorkflow:
                     trading_date="2024-01-03",
                     event_id="daily_review:2024-01-03",
                     auto_execute=True,
-                    trade_executor=MagicMock(),
+                    trade_executor=trade_executor,
                 )
-                assert result.get("execution_error")
-                assert len(result.get("tool_executions") or []) == 1
-                assert result["tool_executions"][0]["success"] is False
+                assert len(result.get("tool_executions") or []) == 0
+                assert len(result.get("execution_results") or []) == 1
+                assert result["execution_results"][0]["success"] is True
 
         logs = manager.list_trade_action_logs(sid, limit=10)
         assert len(logs) >= 1
-        assert logs[0]["status"] == "failed"
-        assert logs[0]["error_code"] == "agent_tool_error"
+        assert logs[0]["status"] == "succeeded"
+        assert logs[0]["reason"] == "from_json"
 
     @pytest.mark.asyncio
-    async def test_trigger_daily_review_recovers_actions_from_successful_tool_when_max_steps_hit(self, setup_workflow):
+    async def test_trigger_daily_review_does_not_recover_actions_from_tool_message(self, setup_workflow):
         workflow = setup_workflow["workflow"]
         sid = setup_workflow["session_id"]
 
@@ -396,11 +407,10 @@ class TestAutoTradingWorkflow:
                     auto_execute=True,
                     trade_executor=MagicMock(),
                 )
-                assert result.get("execution")
-                assert (result.get("decision") or {}).get("decision") == "trade"
-                assert len(result.get("trade_actions") or []) == 1
-                assert result["trade_actions"][0]["ticker"] == "688521"
-                assert "已执行交易" in str(result.get("agent_analysis") or "")
+                assert not result.get("execution")
+                assert not result.get("execution_error")
+                assert len(result.get("trade_actions") or []) == 0
+                assert len(result.get("execution_results") or []) == 0
 
 
 class TestAutoTradingWorkflowConfig:

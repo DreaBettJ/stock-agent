@@ -108,10 +108,48 @@ def setup_logging() -> None:
     """Initialize process logging for tool/backend diagnostics."""
     level_name = os.getenv("MINI_AGENT_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-    )
+
+    # Console handler only. Session file handler is attached later when session_id is known.
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+    console_handler.setFormatter(console_formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    # Avoid duplicate handlers when setup_logging is called multiple times in tests/embedding scenarios.
+    for h in list(root_logger.handlers):
+        if getattr(h, "_mini_agent_console_handler", False):
+            root_logger.removeHandler(h)
+            h.close()
+    setattr(console_handler, "_mini_agent_console_handler", True)
+    root_logger.addHandler(console_handler)
+
+
+def _attach_session_file_logging(session_id: int | str) -> Path:
+    """Attach one session-scoped file handler: log/big_a_helper_{session_id}.log."""
+    level_name = os.getenv("MINI_AGENT_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    sid = str(session_id).strip() or "unknown"
+    safe_sid = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in sid)
+    log_dir = get_log_directory()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"big_a_helper_{safe_sid}.log"
+
+    root_logger = logging.getLogger()
+    for h in list(root_logger.handlers):
+        if getattr(h, "_mini_agent_session_file_handler", False):
+            root_logger.removeHandler(h)
+            h.close()
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(level)
+    file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+    file_handler.setFormatter(file_formatter)
+    setattr(file_handler, "_mini_agent_session_file_handler", True)
+    root_logger.addHandler(file_handler)
+    return log_path
 
 
 def show_log_directory(open_file_manager: bool = True) -> None:
@@ -1169,6 +1207,13 @@ def handle_backtest_command(args: argparse.Namespace, workspace_dir: Path) -> No
     """Handle backtest subcommands."""
     from .backtest import BacktestEngine, PerformanceAnalyzer
 
+    if args.backtest_command in {"run", "result"}:
+        try:
+            log_path = _attach_session_file_logging(args.session)
+            print(f"{Colors.DIM}📝 Session log file: {log_path}{Colors.RESET}")
+        except Exception:
+            pass
+
     try:
         runtime = build_decision_runtime(workspace_dir, get_memory_db_path(workspace_dir))
     except FileNotFoundError as exc:
@@ -1302,6 +1347,15 @@ def handle_event_command(args: argparse.Namespace, workspace_dir: Path) -> None:
     """Handle event subcommands."""
     if args.event_command != "trigger":
         return
+
+    try:
+        if args.all_sessions:
+            log_path = _attach_session_file_logging("event_all")
+        else:
+            log_path = _attach_session_file_logging(args.session_id)
+        print(f"{Colors.DIM}📝 Session log file: {log_path}{Colors.RESET}")
+    except Exception:
+        pass
 
     try:
         event = _build_event_from_args(args)
@@ -2097,6 +2151,7 @@ async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: in
     session_manager = runtime_ctx.session_manager
     session_id = runtime_ctx.session_id
     session_name = runtime_ctx.session_name
+    session_log_path = _attach_session_file_logging(session_id)
     system_prompt = runtime_ctx.effective_system_prompt
     session_state = session_manager.get_session(session_id)
     position_rows = _read_sim_positions(get_memory_db_path(workspace_dir), str(session_id))
@@ -2122,6 +2177,7 @@ async def run_agent(workspace_dir: Path, task: str = None, attach_session_id: in
         print(f"{Colors.GREEN}✅ Attached to existing session: {session_id} ({session_name}){Colors.RESET}")
     else:
         print(f"{Colors.GREEN}✅ Runtime session started: {session_id} ({session_name}){Colors.RESET}")
+    print(f"{Colors.DIM}📝 Session log file: {session_log_path}{Colors.RESET}")
 
     auto_trade_rule = (
         "【交易执行规则】\n"

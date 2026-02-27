@@ -102,7 +102,7 @@ class AutoTradingWorkflow:
         # - user prompt: 当次事件上下文（持仓/市场/分层）
         system_prompt = self._build_daily_review_system_prompt(
             strategy_prompt=strategy_prompt,
-            allow_tool_execution=bool(auto_execute and trade_executor is not None),
+            allow_tool_execution=False,
         )
         prompt = self._build_review_prompt(
             session=session,
@@ -128,14 +128,10 @@ class AutoTradingWorkflow:
             api_key=self.api_key,
         )
 
-        agent_tools = []
-        if auto_execute and trade_executor is not None:
-            agent_tools = [trade_executor]
-
         agent = Agent(
             llm_client=llm,
             system_prompt=system_prompt,
-            tools=agent_tools,
+            tools=[],
             session_id=session_id,
         )
         
@@ -151,96 +147,9 @@ class AutoTradingWorkflow:
         trade_actions = list(decision.get("actions") or [])
         trade_signal = trade_actions[0] if trade_actions else None
         tool_executions: list[dict[str, Any]] = []
-        tool_success_actions: list[dict[str, Any]] = []
         execution = None
         execution_results: list[dict[str, Any]] = []
-
-        # Prefer Agent-initiated tool execution. Fallback to parser-triggered execution only if no tool trade happened.
-        for msg in agent.messages:
-            if msg.role != "tool":
-                continue
-            content = str(msg.content or "")
-            if "SIM_TRADE_OK" in content:
-                tool_executions.append({"success": True, "content": content})
-                parsed = self._parse_sim_trade_tool_content(content)
-                side = str(parsed.get("action") or "").strip().lower()
-                ticker = str(parsed.get("ticker") or "").strip()
-                qty = int(parsed.get("quantity") or 0)
-                if side in {"buy", "sell"} and ticker and qty > 0:
-                    tool_success_actions.append(
-                        {
-                            "action": side,
-                            "ticker": ticker,
-                            "quantity": qty,
-                            "trade_date": effective_date,
-                            "reason": "agent_tool_call",
-                        }
-                    )
-                self.session_manager.record_trade_action_log(
-                    session_id=session_id,
-                    event_id=event_id,
-                    event_type="daily_review",
-                    action=parsed.get("action"),
-                    ticker=parsed.get("ticker"),
-                    quantity=parsed.get("quantity"),
-                    trade_date=effective_date,
-                    status="succeeded",
-                    error_code=None,
-                    reason="agent_tool_call",
-                    request_payload=parsed,
-                    response_payload={"content": content},
-                )
-            elif str(msg.name or "").strip() == "simulate_trade" or content.strip().lower().startswith("error:"):
-                tool_executions.append({"success": False, "error": content})
-                parsed = self._parse_sim_trade_tool_content(content)
-                self.session_manager.record_trade_action_log(
-                    session_id=session_id,
-                    event_id=event_id,
-                    event_type="daily_review",
-                    action=parsed.get("action"),
-                    ticker=parsed.get("ticker"),
-                    quantity=parsed.get("quantity"),
-                    trade_date=effective_date,
-                    status="failed",
-                    error_code="agent_tool_error",
-                    reason="agent_tool_call",
-                    request_payload=parsed,
-                    response_payload={"error": content},
-                )
-
-        if tool_executions:
-            last_exec = tool_executions[-1]
-            if last_exec.get("success"):
-                class _Execution:
-                    success = True
-                    content = str(last_exec.get("content") or "")
-                    error = None
-
-                execution = _Execution()
-            else:
-                class _ExecutionFail:
-                    success = False
-                    content = ""
-                    error = str(last_exec.get("error") or "trade execution failed")
-
-                execution = _ExecutionFail()
-        # If tool execution already succeeded but parser has empty signal
-        # (e.g. run ended by max_steps fallback text), recover actions from tool logs.
-        if tool_success_actions:
-            if not trade_actions:
-                trade_actions = tool_success_actions
-                trade_signal = trade_actions[0]
-            if str(result).strip().startswith("Task couldn't be completed"):
-                parts = [
-                    f"{x['action']} {x['ticker']} x{x['quantity']}"
-                    for x in tool_success_actions
-                ]
-                result = f"已执行交易：{'; '.join(parts)}"
-            if decision.get("decision") != "trade":
-                decision["decision"] = "trade"
-                decision["actions"] = trade_actions
-                decision["summary"] = str(decision.get("summary") or "tool execution succeeded")
-        elif auto_execute and trade_actions and trade_executor is not None:
+        if auto_execute and trade_actions and trade_executor is not None:
             for action in trade_actions:
                 side = str(action.get("action") or "").strip().lower()
                 ticker = str(action.get("ticker") or "").strip()
@@ -1313,13 +1222,11 @@ class AutoTradingWorkflow:
 
     def _build_daily_review_system_prompt(self, strategy_prompt: str, allow_tool_execution: bool = False) -> str:
         """Build daily review system prompt (session-level policy only)."""
-        execution_rule = ""
-        if allow_tool_execution:
-            execution_rule = """
+        _ = allow_tool_execution
+        execution_rule = """
 【执行约束】
-- 你可以直接调用工具 `simulate_trade` 执行模拟交易。
-- 如果你判断需要调仓，优先调用工具完成执行，不要只输出“买入/卖出文本信号”。
-- 调用完成后，用简短中文总结执行结果与原因。
+- 你处于“分析阶段”，严禁调用任何交易执行工具（包括 `simulate_trade`）。
+- 你只能输出结构化决策 JSON；实际执行由系统在风控校验后统一完成。
 """
         return f"{strategy_prompt}\n{execution_rule}".strip()
 

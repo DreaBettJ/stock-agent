@@ -131,6 +131,8 @@ class SimulateTradeTool(Tool):
 
     COMMISSION_RATE = 0.0003
     STAMP_DUTY_RATE = 0.001
+    # Major A-share market index codes. They are not tradable stock tickers.
+    BLOCKED_INDEX_TICKERS = {"000001", "399001", "399006", "000300"}
 
     def __init__(
         self,
@@ -172,6 +174,10 @@ class SimulateTradeTool(Tool):
     def _kechuang_buy_enabled() -> bool:
         raw = str(os.getenv("MINI_AGENT_ENABLE_KECHUANG", "")).strip().lower()
         return raw in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _is_blocked_index_ticker(cls, symbol: str) -> bool:
+        return str(symbol or "").strip() in cls.BLOCKED_INDEX_TICKERS
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -219,6 +225,12 @@ class SimulateTradeTool(Tool):
                 )
 
             symbol = self.kline_db.normalize_ticker(ticker)
+            if self._is_blocked_index_ticker(symbol):
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=f"market index ticker is not tradable: {symbol}",
+                )
             action_normalized = action.strip().lower()
             
             # Buy/Sell both use next open price to avoid look-ahead bias in backtest.

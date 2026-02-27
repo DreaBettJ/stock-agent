@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -438,6 +438,38 @@ class SessionManager:
             return value.isoformat()
         return date.fromisoformat(value).isoformat()
 
+    @staticmethod
+    def _parse_db_datetime(value: str | None) -> datetime | None:
+        """Parse DB datetime with UTC->UTC+8 normalization for SQLite CURRENT_TIMESTAMP rows.
+
+        Rules:
+        - SQLite CURRENT_TIMESTAMP style (`YYYY-MM-DD HH:MM:SS[.fff]`) is treated as UTC and converted to UTC+8.
+        - ISO 8601 with timezone is converted to UTC+8.
+        - ISO 8601 without timezone is kept as-is (application-local historical behavior).
+        """
+        if not value:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+
+        # SQLite CURRENT_TIMESTAMP format (UTC).
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                utc_dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+                return utc_dt.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+            except ValueError:
+                pass
+
+        # ISO 8601 string.
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return dt
+            return dt.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+        except ValueError:
+            return None
+
     def _row_to_session(self, row: sqlite3.Row) -> ExperimentSession:
         event_filter_raw = row["event_filter"]
         event_filter: list[str] = []
@@ -468,8 +500,8 @@ class SessionManager:
             backtest_end=self._parse_date(row["backtest_end"]),
             current_date=self._parse_date(row["current_date"]),
             event_filter=event_filter,
-            created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
-            updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None,
+            created_at=self._parse_db_datetime(row["created_at"]),
+            updated_at=self._parse_db_datetime(row["updated_at"]),
         )
 
     def create_session(self, name: str, system_prompt: str, mode: str, **kwargs: Any) -> int:

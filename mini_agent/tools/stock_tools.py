@@ -228,6 +228,10 @@ class LocalAShareDataBackend(AShareDataBackend):
             elif strategy == "dividend":
                 if abs(change_pct) <= 6.0 and amplitude <= 8.0 and amount >= 1e8:
                     filtered.append(item)
+            elif strategy == "growth":
+                # 高成长：放宽涨跌幅限制，关注流动性
+                if abs(change_pct) <= 12.0 and amount >= 3e8:
+                    filtered.append(item)
             else:  # quality
                 if abs(change_pct) <= 9.5 and amplitude <= 12.0:
                     filtered.append(item)
@@ -337,6 +341,357 @@ class LocalAShareDataBackend(AShareDataBackend):
             },
             "score": 60 if trend == "up" else 40,
         }
+
+    async def get_market_index(self, timestamp: str | None = None) -> dict[str, Any]:
+        """获取大盘指数，优先同日实时快照，失败后降级到日线数据。"""
+        import warnings
+        warnings.filterwarnings("ignore")
+        
+        normalized_ts = normalize_timestamp(timestamp)
+        asof_dt = datetime.fromisoformat(normalized_ts)
+        now_dt = datetime.now(asof_dt.tzinfo) if asof_dt.tzinfo else datetime.now()
+        prefer_realtime = asof_dt.date() == now_dt.date()
+        
+        # 指数代码映射: 本地代码 -> (Yahoo代码, TuShare代码, AkShare代码, 名称)
+        index_map = {
+            "000001": ("^SSEC", "000001.SH", "sh000001", "上证指数"),
+            "399001": ("399001.SZ", "399001.SZ", "sz399001", "深证成指"),
+            "399006": ("399006.SZ", "399006.SZ", "sz399006", "创业板指"),
+            "000300": ("^CSI300", "000300.SH", "sh000300", "沪深300"),
+        }
+        
+        results = {}
+        source_used = None
+        
+        # 1) 同日查询优先实时快照，避免在交易日返回“昨日收盘”造成误导。
+        if prefer_realtime:
+            logger.info("尝试获取大盘指数: AkShare 实时快照...")
+            realtime_results = await self._get_akshare_index_spot(index_map, normalized_ts)
+            if realtime_results:
+                logger.info("✅ AkShare 实时快照获取成功")
+                return {
+                    "timestamp": normalized_ts,
+                    "source": "akshare:spot",
+                    "mode": "realtime",
+                    "as_of_date": asof_dt.strftime("%Y-%m-%d"),
+                    "indices": realtime_results,
+                }
+
+        # 2. 尝试 Yahoo Finance（日线）
+        logger.info("尝试获取大盘指数: Yahoo Finance...")
+        yahoo_results = await self._get_yahoo_index(index_map)
+        if yahoo_results:
+            results.update(yahoo_results)
+            source_used = "yahoo_finance"
+            logger.info("✅ Yahoo Finance 获取成功")
+            await self._save_index_to_db(results, source_used)
+            return {
+                "timestamp": normalized_ts,
+                "source": source_used,
+                "mode": "daily",
+                "as_of_date": max(str(v.get("date", "")) for v in results.values()) if results else None,
+                "indices": results,
+            }
+        
+        # 3. 尝试 TuShare (如果配置了token, 日线)
+        logger.info("尝试获取大盘指数: TuShare...")
+        tushare_results = await self._get_tushare_index(index_map)
+        if tushare_results:
+            results.update(tushare_results)
+            source_used = "tushare"
+            logger.info("✅ TuShare 获取成功")
+            await self._save_index_to_db(results, source_used)
+            return {
+                "timestamp": normalized_ts,
+                "source": source_used,
+                "mode": "daily",
+                "as_of_date": max(str(v.get("date", "")) for v in results.values()) if results else None,
+                "indices": results,
+            }
+        
+        # 4. 尝试 AkShare（日线）
+        logger.info("尝试获取大盘指数: AkShare...")
+        akshare_results = await self._get_akshare_index(index_map)
+        if akshare_results:
+            results.update(akshare_results)
+            source_used = "akshare"
+            logger.info("✅ AkShare 获取成功")
+            await self._save_index_to_db(results, source_used)
+            return {
+                "timestamp": normalized_ts,
+                "source": source_used,
+                "mode": "daily",
+                "as_of_date": max(str(v.get("date", "")) for v in results.values()) if results else None,
+                "indices": results,
+            }
+        
+        # 5. 降级到本地数据库（日线）
+        logger.info("降级到本地数据库获取大盘指数...")
+        local_results = await self._get_local_index(index_map, normalized_ts)
+        
+        return {
+            "timestamp": normalized_ts,
+            "source": "local:daily_kline",
+            "mode": "daily",
+            "as_of_date": max(str(v.get("date", "")) for v in local_results.values()) if local_results else None,
+            "indices": local_results,
+        }
+
+    async def _get_akshare_index_spot(self, index_map: dict, timestamp: str) -> dict:
+        """从 AkShare 实时快照接口获取指数数据。"""
+        try:
+            import akshare as ak
+            import pandas as pd  # type: ignore
+        except ImportError:
+            return {}
+
+        try:
+            df = ak.stock_zh_index_spot_sina()
+        except Exception as e:
+            logger.debug(f"AkShare 实时指数获取失败: {e}")
+            return {}
+
+        if df is None or df.empty:
+            return {}
+
+        def _to_float(value: Any) -> float:
+            try:
+                if value is None:
+                    return 0.0
+                parsed = pd.to_numeric(value, errors="coerce")
+                if pd.isna(parsed):
+                    return 0.0
+                return float(parsed)
+            except Exception:
+                return 0.0
+
+        code_col = None
+        for candidate in ("代码", "symbol", "指数代码", "code"):
+            if candidate in df.columns:
+                code_col = candidate
+                break
+        if code_col is None:
+            return {}
+
+        work = df.copy()
+        work[code_col] = work[code_col].astype(str).str.lower().str.strip()
+
+        results: dict[str, dict[str, Any]] = {}
+        date_str = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d")
+
+        for local_code, (_, _, akshare_code, name) in index_map.items():
+            candidates = {local_code.lower(), akshare_code.lower()}
+            row_df = work[work[code_col].isin(candidates)]
+            if row_df.empty:
+                continue
+
+            row = row_df.iloc[0]
+            open_price = _to_float(row.get("今开", row.get("open", 0)))
+            high_price = _to_float(row.get("最高", row.get("high", 0)))
+            low_price = _to_float(row.get("最低", row.get("low", 0)))
+            close_price = _to_float(row.get("最新价", row.get("close", 0)))
+            volume = _to_float(row.get("成交量", row.get("volume", 0)))
+
+            change_pct = _to_float(row.get("涨跌幅", row.get("change_percent", 0)))
+            if abs(change_pct) > 1000:
+                change_pct = change_pct / 100
+
+            results[local_code] = {
+                "name": name,
+                "date": date_str,
+                "close": close_price,
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "volume": volume,
+                "change_pct": round(change_pct, 2),
+            }
+        return results
+
+    async def _get_tushare_index(self, index_map: dict) -> dict:
+        """从 TuShare 获取指数数据"""
+        try:
+            import tushare as ts
+            
+            token = os.getenv("TUSHARE_TOKEN") or os.getenv("TS_TOKEN")
+            if not token:
+                logger.debug("TuShare token 未配置")
+                return {}
+            
+            ts.set_token(token)
+            pro = ts.pro_api()
+            
+            results = {}
+            ts_code_map = {"000001": "000001.SH", "399001": "399001.SZ", "399006": "399006.SZ", "000300": "000300.SH"}
+            
+            for code, (yahoo_code, ts_code, akshare_code, name) in index_map.items():
+                try:
+                    df = pro.index_daily(ts_code=ts_code_map.get(code))
+                    if df is not None and not df.empty:
+                        latest = df.iloc[0]
+                        prev = df.iloc[1] if len(df) > 1 else latest
+                        close = float(latest.get('close', 0))
+                        prev_close = float(prev.get('close', close))
+                        change_pct = ((close - prev_close) / prev_close * 100) if prev_close else 0
+                        
+                        results[code] = {
+                            "name": name, "date": str(latest.get('trade_date', '')),
+                            "close": close, "open": float(latest.get('open', 0)),
+                            "high": float(latest.get('high', 0)), "low": float(latest.get('low', 0)),
+                            "volume": float(latest.get('vol', 0)), "change_pct": round(change_pct, 2),
+                        }
+                except Exception as e:
+                    logger.debug(f"TuShare index {code} failed: {e}")
+                    continue
+            
+            return results
+        except Exception as e:
+            logger.debug(f"TuShare 获取失败: {e}")
+            return {}
+
+    async def _get_local_index(self, index_map: dict, timestamp: str) -> dict:
+        """从本地数据库获取指数数据"""
+        asof = datetime.fromisoformat(timestamp).replace(tzinfo=None).strftime("%Y-%m-%d")
+        
+        results = {}
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            for code, (_, _, _, name) in index_map.items():
+                row = conn.execute(
+                    """SELECT ticker, date, open, high, low, close, volume, amount
+                    FROM daily_kline WHERE ticker = ? AND date <= ? ORDER BY date DESC LIMIT 1""",
+                    (code, asof),
+                ).fetchone()
+
+                if row:
+                    prev_row = conn.execute(
+                        """SELECT close FROM daily_kline WHERE ticker = ? AND date < ? ORDER BY date DESC LIMIT 1""",
+                        (code, row["date"]),
+                    ).fetchone()
+
+                    prev_close = prev_row["close"] if prev_row else row["close"]
+                    change_pct = ((row["close"] - prev_close) / prev_close * 100) if prev_close else 0
+
+                    results[code] = {
+                        "name": name, "date": row["date"], "close": row["close"],
+                        "open": row["open"], "high": row["high"], "low": row["low"],
+                        "volume": row["volume"], "change_pct": round(change_pct, 2),
+                    }
+        return results
+
+    async def _get_yahoo_index(self, index_map: dict) -> dict:
+        """从 Yahoo Finance 获取指数数据"""
+        try:
+            import yfinance as yf
+            
+            results = {}
+            for code, (yahoo_code, _, _, name) in index_map.items():
+                try:
+                    ticker = yf.Ticker(yahoo_code)
+                    hist = ticker.history(period="5d")
+                    if hist is not None and not hist.empty:
+                        latest = hist.iloc[-1]
+                        prev = hist.iloc[-2] if len(hist) > 1 else latest
+                        change_pct = ((latest['Close'] - prev['Close']) / prev['Close'] * 100) if prev['Close'] else 0
+                        
+                        results[code] = {
+                            "name": name,
+                            "date": str(latest.name.date()) if hasattr(latest.name, 'date') else str(datetime.now().date()),
+                            "close": round(latest['Close'], 2),
+                            "open": round(latest['Open'], 2),
+                            "high": round(latest['High'], 2),
+                            "low": round(latest['Low'], 2),
+                            "volume": latest['Volume'],
+                            "change_pct": round(change_pct, 2),
+                        }
+                except Exception as e:
+                    logger.debug(f"Yahoo index {code} failed: {e}")
+                    continue
+            
+            return results
+        except ImportError:
+            return {}
+
+    async def _get_akshare_index(self, index_map: dict) -> dict:
+        """从 AkShare 获取指数数据"""
+        try:
+            import akshare as ak
+            
+            results = {}
+            for code, (_, _, akshare_code, name) in index_map.items():
+                try:
+                    df = ak.stock_zh_index_daily(symbol=akshare_code)
+                    
+                    if df is not None and not df.empty:
+                        latest = df.iloc[-1]
+                        prev = df.iloc[-2] if len(df) > 1 else latest
+                        
+                        close = float(latest.get('close', 0))
+                        prev_close = float(prev.get('close', close))
+                        change_pct = ((close - prev_close) / prev_close * 100) if prev_close else 0
+                        
+                        results[code] = {
+                            "name": name,
+                            "date": str(latest.get('date', '')),
+                            "close": close,
+                            "open": float(latest.get('open', 0)),
+                            "high": float(latest.get('high', 0)),
+                            "low": float(latest.get('low', 0)),
+                            "volume": float(latest.get('volume', 0)),
+                            "change_pct": round(change_pct, 2),
+                        }
+                except Exception as e:
+                    logger.debug(f"AkShare index {code} failed: {e}")
+                    continue
+            
+            return results
+        except ImportError:
+            return {}
+
+    async def _save_index_to_db(self, indices: dict, source: str) -> None:
+        """将指数数据存储到本地数据库"""
+        from datetime import datetime
+        
+        records = []
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        for code, data in indices.items():
+            date = data.get("date", "")
+            if not date:
+                continue
+                
+            record = {
+                "ticker": code,
+                "date": date,
+                "open": data.get("open", 0),
+                "high": data.get("high", 0),
+                "low": data.get("low", 0),
+                "close": data.get("close", 0),
+                "volume": data.get("volume", 0),
+                "amount": data.get("close", 0) * data.get("volume", 0),
+                "created_at": now,
+            }
+            records.append(record)
+        
+        if not records:
+            return
+            
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                for record in records:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO daily_kline 
+                        (ticker, date, open, high, low, close, volume, amount, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        record["ticker"], record["date"], record["open"], 
+                        record["high"], record["low"], record["close"],
+                        record["volume"], record["amount"], record["created_at"]
+                    ))
+                conn.commit()
+                logger.info(f"已存储 {len(records)} 条指数数据到本地 (source: {source})")
+        except Exception as e:
+            logger.warning(f"存储指数数据失败: {e}")
 
 
 class TuShareDataBackend(AShareDataBackend):
@@ -608,6 +963,10 @@ class TuShareDataBackend(AShareDataBackend):
         elif strategy == "value":
             if {"市盈率-动态", "市净率"}.issubset(df.columns):
                 df = df[(df["市盈率-动态"] > 0) & (df["市盈率-动态"] <= 22) & (df["市净率"] <= 2.8)]
+        elif strategy == "growth":
+            # 高成长策略：放宽估值限制，关注流动性
+            if {"市盈率-动态", "成交额"}.issubset(df.columns):
+                df = df[(df["市盈率-动态"] > 0) & (df["市盈率-动态"] <= 80) & (df["成交额"] >= 3e8)]
         logger.info(
             "TuShare screen layer2 strategy_filter: strategy=%s before=%s after=%s removed=%s",
             strategy,
@@ -1003,18 +1362,38 @@ class AkShareDataBackend(AShareDataBackend):
         timestamp = normalize_timestamp(timestamp)
         symbol = self._ticker_to_symbol(ticker)
 
-        indicator_df = await self._run_akshare_call(self.ak.stock_financial_analysis_indicator, symbol=symbol)
-        indicator_df = self._asof_filter(indicator_df, timestamp) if indicator_df is not None else indicator_df
-        latest_indicator = (
-            self._row_to_dict(indicator_df.iloc[-1]) if indicator_df is not None and not indicator_df.empty else None
-        )
+        # 使用 stock_financial_benefit_new_ths 获取财务指标（已修复替代失效的 stock_financial_analysis_indicator）
+        latest_indicator = None
+        try:
+            indicator_df = await self._run_akshare_call(self.ak.stock_financial_benefit_new_ths, symbol=symbol)
+            if indicator_df is not None and not indicator_df.empty:
+                # 转换为宽表格式，按指标名称展开
+                latest_df = indicator_df[indicator_df["report_date"] == indicator_df["report_date"].max()]
+                if not latest_df.empty:
+                    # 将行转换为字典，保留指标名和值
+                    indicator_dict = {}
+                    for _, row in latest_df.iterrows():
+                        metric = row.get("metric_name", "")
+                        value = row.get("value")
+                        yoy = row.get("yoy")
+                        if metric and value is not None and value != "":
+                            indicator_dict[metric] = {"value": value, "yoy": yoy}
+                    latest_indicator = indicator_dict
+        except Exception:
+            latest_indicator = None
 
+        # 使用 stock_individual_info_em 获取估值和基本信息（已修复替代失效的 stock_a_lg_indicator）
         valuation = None
         try:
-            valuation_df = await self._run_akshare_call(self.ak.stock_a_lg_indicator, symbol=symbol)
-            valuation_df = self._asof_filter(valuation_df, timestamp)
-            if valuation_df is not None and not valuation_df.empty:
-                valuation = self._row_to_dict(valuation_df.iloc[-1])
+            info_df = await self._run_akshare_call(self.ak.stock_individual_info_em, symbol=symbol)
+            if info_df is not None and not info_df.empty:
+                # 转换为字典格式
+                valuation = {}
+                for _, row in info_df.iterrows():
+                    item = row.get("item", "")
+                    value = row.get("value")
+                    if item:
+                        valuation[item] = value
         except Exception:
             valuation = None
 
@@ -1307,6 +1686,10 @@ class AkShareDataBackend(AShareDataBackend):
         elif strategy == "value":
             if {"市盈率-动态", "市净率"}.issubset(df.columns):
                 df = df[(df["市盈率-动态"] > 0) & (df["市盈率-动态"] <= 22) & (df["市净率"] <= 2.8)]
+        elif strategy == "growth":
+            # 高成长策略：放宽估值限制，关注流动性和适度涨幅
+            if {"市盈率-动态", "市净率", "成交额"}.issubset(df.columns):
+                df = df[(df["市盈率-动态"] > 0) & (df["市盈率-动态"] <= 80) & (df["成交额"] >= 3e8)]  # 成长股估值偏高，需放宽
         logger.info("Screen layer2 strategy_filter: strategy=%s before=%s after=%s removed=%s", strategy, before, len(df), before - len(df))
 
         if df.empty:
@@ -1375,6 +1758,16 @@ class AkShareDataBackend(AShareDataBackend):
                 "score_volatility": 0.06,
                 "score_momentum_stability": 0.04,
             },
+            "growth": {
+                # 高成长策略：看重流动性、适度市值、动量，宽松估值
+                "score_size": 0.20,
+                "score_liquidity": 0.30,  # 高流动性意味着市场关注度高
+                "score_pe": 0.10,  # 成长股估值通常偏高，降低权重
+                "score_pb": 0.08,
+                "score_volatility": 0.12,  # 适度波动
+                "score_turnover": 0.10,
+                "score_momentum_stability": 0.10,  # 适度关注动量
+            },
         }
         weights = weights_map.get(strategy, weights_map["quality"])
 
@@ -1424,6 +1817,15 @@ class AkShareDataBackend(AShareDataBackend):
             picked_scores,
         )
         return rows
+
+    async def get_market_index(self, timestamp: str | None = None) -> dict[str, Any]:
+        """Get major market indices - AkShare网络不稳定，返回提示信息"""
+        return {
+            "timestamp": normalize_timestamp(timestamp),
+            "source": "akshare",
+            "error": "AkShare network unavailable. Please use local data source.",
+            "indices": {},
+        }
 
 
 class PreferredAShareDataBackend(AShareDataBackend):
@@ -1489,6 +1891,9 @@ class PreferredAShareDataBackend(AShareDataBackend):
         window: int = 120,
     ) -> dict[str, Any]:
         return await self._call("get_technical_signals", ticker=ticker, timestamp=timestamp, window=window)
+
+    async def get_market_index(self, timestamp: str | None = None) -> dict[str, Any]:
+        return await self._call("get_market_index", timestamp=timestamp)
 
 
 class AShareQuoteTool(Tool):
@@ -1722,6 +2127,43 @@ class AShareTechnicalSignalsTool(Tool):
             return ToolResult(success=False, content="", error=f"Failed to get technical signals: {e}")
 
 
+class AShareMarketIndexTool(Tool):
+    """Get major market indices: Shanghai, Shenzhen, ChiNext, CSI300"""
+
+    def __init__(self, backend: AShareDataBackend):
+        self.backend = backend
+
+    @property
+    def name(self) -> str:
+        return "get_market_index"
+
+    @property
+    def description(self) -> str:
+        return "Get major A-share market indices (Shanghai, Shenzhen, ChiNext, CSI300) with daily行情"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "timestamp": {
+                    "type": "string",
+                    "description": "Optional analysis time in ISO 8601. If omitted, realtime mode is used.",
+                },
+            },
+        }
+
+    async def execute(self, timestamp: str | None = None) -> ToolResult:
+        try:
+            normalized_ts = normalize_timestamp(timestamp)
+            data = await self.backend.get_market_index(timestamp=normalized_ts)
+            return ToolResult(success=True, content=json.dumps(data, ensure_ascii=False, indent=2))
+        except NotImplementedError as e:
+            return ToolResult(success=False, content="", error=str(e))
+        except Exception as e:
+            return ToolResult(success=False, content=f"Failed to get market index: {e}")
+
+
 class ConservativeTradePlanTool(Tool):
     """Build a conservative trade plan based on supplied analysis inputs."""
 
@@ -1881,5 +2323,6 @@ def create_a_share_tools(
         AShareQuoteTool(data_backend),
         AShareFundamentalsTool(data_backend),
         AShareNewsTool(data_backend),
+        AShareMarketIndexTool(data_backend),
         ConservativeTradePlanTool(),
     ]

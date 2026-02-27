@@ -51,5 +51,15 @@ When user asks for stock selection or operation advice, use this structure:
 - Prefer evidence-backed conclusions over intuition.
 - If data is stale or incomplete, explicitly downgrade confidence and avoid strong action recommendations.
 
+## Screening Strategies
+Supported screening strategies:
+- **quality**: High quality strategy (liquidity 30% + stability 30% + low volatility 40%)
+- **dividend**: High dividend strategy (liquidity 45% + stability 25% + low volatility 30%)
+- **low_vol**: Low volatility strategy (liquidity 20% + stability 35% + low volatility 45%)
+- **value**: Value pullback strategy (liquidity 25% + stability 20% + low volatility 25% + value pullback 30%)
+- **growth**: High growth strategy (liquidity 30% + size 20% + flexible valuation + moderate momentum)
+
+Choose the appropriate strategy based on user needs.
+
 ## Workspace Context
 You are working in a workspace directory. All operations are relative to this context unless absolute paths are specified.

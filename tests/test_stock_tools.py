@@ -211,6 +211,75 @@ async def test_local_screen_stocks_strategy_diff_and_scores(tmp_path):
     assert all(isinstance(x.get("factor_scores"), dict) and x.get("factor_scores") for x in value_rows)
 
 
+@pytest.mark.asyncio
+async def test_local_market_index_prefers_realtime_on_same_day(tmp_path, monkeypatch):
+    db_path = tmp_path / "market_index_realtime.db"
+    backend = LocalAShareDataBackend(db_path=str(db_path))
+
+    async def fake_spot(index_map, timestamp):
+        return {
+            "000001": {
+                "name": "上证指数",
+                "date": "2026-02-26",
+                "close": 4200.0,
+                "open": 4180.0,
+                "high": 4210.0,
+                "low": 4175.0,
+                "volume": 1.0,
+                "change_pct": 1.23,
+            }
+        }
+
+    async def fail_daily(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("daily path should not be called when realtime spot succeeds")
+
+    monkeypatch.setattr(backend, "_get_akshare_index_spot", fake_spot)
+    monkeypatch.setattr(backend, "_get_yahoo_index", fail_daily)
+
+    result = await backend.get_market_index()
+
+    assert result["mode"] == "realtime"
+    assert result["source"] == "akshare:spot"
+    assert result["indices"]["000001"]["close"] == 4200.0
+
+
+@pytest.mark.asyncio
+async def test_local_market_index_daily_marks_as_of_date(tmp_path, monkeypatch):
+    db_path = tmp_path / "market_index_daily.db"
+    backend = LocalAShareDataBackend(db_path=str(db_path))
+
+    async def empty_spot(index_map, timestamp):
+        return {}
+
+    async def fake_yahoo(index_map):
+        return {
+            "000001": {
+                "name": "上证指数",
+                "date": "2026-02-25",
+                "close": 4147.231,
+                "open": 4123.781,
+                "high": 4167.844,
+                "low": 4122.699,
+                "volume": 72478721400.0,
+                "change_pct": 0.72,
+            }
+        }
+
+    async def fake_save(indices, source):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(backend, "_get_akshare_index_spot", empty_spot)
+    monkeypatch.setattr(backend, "_get_yahoo_index", fake_yahoo)
+    monkeypatch.setattr(backend, "_save_index_to_db", fake_save)
+
+    result = await backend.get_market_index(timestamp="2025-01-15T10:00:00+08:00")
+
+    assert result["mode"] == "daily"
+    assert result["source"] == "yahoo_finance"
+    assert result["as_of_date"] == "2026-02-25"
+    assert result["indices"]["000001"]["date"] == "2026-02-25"
+
+
 class TestAShareTechnicalSignalsTool:
     """Test AShareTechnicalSignalsTool class."""
 
@@ -327,7 +396,7 @@ def test_create_a_share_tools():
     
     tools = create_a_share_tools()
     
-    assert len(tools) == 6
+    assert len(tools) == 7
     
     tool_names = [t.name for t in tools]
     assert "screen_a_share_stocks" in tool_names
@@ -335,6 +404,7 @@ def test_create_a_share_tools():
     assert "get_a_share_quote" in tool_names
     assert "get_a_share_fundamentals" in tool_names
     assert "get_a_share_news" in tool_names
+    assert "get_market_index" in tool_names
     assert "build_conservative_trade_plan" in tool_names
 
 
@@ -345,7 +415,7 @@ def test_create_a_share_tools_with_backend():
     backend = PlaceholderAShareDataBackend()
     tools = create_a_share_tools(backend)
     
-    assert len(tools) == 6
+    assert len(tools) == 7
 
 
 def test_create_a_share_tools_prefers_tushare_chain(monkeypatch):
@@ -375,7 +445,7 @@ def test_create_a_share_tools_prefers_tushare_chain(monkeypatch):
     monkeypatch.setattr(stock_tools, "TuShareDataBackend", DummyTs)
 
     tools = create_a_share_tools()
-    assert len(tools) == 6
+    assert len(tools) == 7
     assert isinstance(tools[0].backend, stock_tools.PreferredAShareDataBackend)
 
 
@@ -407,7 +477,7 @@ def test_create_a_share_tools_falls_back_to_akshare_when_tushare_unavailable(mon
     monkeypatch.setattr(stock_tools, "TuShareDataBackend", DummyTsFailure)
 
     tools = create_a_share_tools()
-    assert len(tools) == 6
+    assert len(tools) == 7
     # Local backend is wrapped as primary; remote AkShare is fallback.
     assert isinstance(tools[0].backend, stock_tools.PreferredAShareDataBackend)
 
