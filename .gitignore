@@ -66,3 +66,4 @@ CLAUDE.md
 .agent_memory.db-*
 
 /log/*
+/.strategy_lab_sessions
